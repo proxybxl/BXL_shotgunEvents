@@ -26,18 +26,36 @@ http://shotgunsoftware.github.com/shotgunEvents
 __version__ = "1.0"
 __version_info__ = (1, 0)
 
-import concurrent.futures
 import datetime
+import threading
 import logging
 import logging.handlers
 import os
 import pprint
+import queue
 import socket
 import sys
 import time
 import traceback
 import configparser
 import pickle
+
+#
+# BOXEL Customizations
+#
+print("Boxel adding third party modules")
+packages = r"/srv/shotgunEvents-master/src/site-packages"
+if packages not in sys.path:
+    sys.path.append(packages)
+
+print("Boxel adding triggers modules")
+sys.path.append(r"/srv/shotgunEvents-master/src/bxl_triggers")
+
+# Boxel modules
+from bxl_triggers.common import slack_msj
+
+from distutils.version import StrictVersion
+
 
 if sys.platform == "win32":
     import win32serviceutil
@@ -159,17 +177,6 @@ class Config(configparser.ConfigParser):
 
     def getPluginPaths(self):
         return [s.strip() for s in self.get("plugins", "paths").split(",")]
-
-    def getPluginMaxWorkers(self):
-        """
-        Maximum number of plugins that can be processed simultaneously (in
-        separate threads) for a single collection. If not set, defaults to
-        one worker thread per loaded plugin so that every plugin always runs
-        concurrently with the others.
-        """
-        if self.has_option("plugins", "max_workers"):
-            return self.getint("plugins", "max_workers")
-        return None
 
     def getSMTPEnabled(self):
         return self.getboolean("emails", "enabled")
@@ -372,9 +379,27 @@ class Engine(object):
             self._mainLoop()
         except KeyboardInterrupt:
             self.log.warning("Keyboard interrupt. Cleaning up...")
+            # Fire-and-forget: a blocking send_slack_message() call
+            # here would hold up shutdown itself if Slack (or the
+            # network) is slow to respond, forcing a second Ctrl+C to
+            # actually kill the process instead of exiting cleanly -
+            # observed directly once already (the traceback showed
+            # this call still stuck in sock.connect() when the second
+            # KeyboardInterrupt landed).
+            threading.Thread(
+                target=slack_msj.send_slack_message,
+                args=("Boxel site: Daemon stopped by user.",),
+                daemon=True,
+            ).start()
         except Exception as err:
             msg = "Crash!!!!! Unexpected error (%s) in main loop.\n\n%s"
             self.log.critical(msg, type(err), traceback.format_exc())
+
+            threading.Thread(
+                target=slack_msj.send_slack_message,
+                args=(msg % (type(err), traceback.format_exc()),),
+                daemon=True,
+            ).start()
 
     def _loadEventIdData(self):
         """
@@ -446,6 +471,29 @@ class Engine(object):
                         )
                         for collection in self._pluginCollections:
                             collection.setState(lastEventId)
+                except EOFError:
+                    # The file exists but is completely empty - e.g. a
+                    # previous run was killed (Ctrl+C, SIGTERM, crash)
+                    # between _saveEventIdData() truncating the file
+                    # and pickle.dump() actually writing to it. There's
+                    # no legacy int to recover here (nothing at all to
+                    # read), so treat this exactly like a missing file:
+                    # fall back to the latest event id in Shotgun
+                    # instead of silently leaving every collection
+                    # with no starting point, which would make
+                    # _getNewEvents() never fetch anything at all.
+                    fh.close()
+                    self.log.warning(
+                        "Event id file %s exists but is empty (likely "
+                        "left behind by an interrupted write) - "
+                        "falling back to the latest event id in "
+                        "Shotgun.",
+                        eventIdFile,
+                    )
+                    lastEventId = self._getLastEventIdFromDatabase()
+                    if lastEventId:
+                        for collection in self._pluginCollections:
+                            collection.setState(lastEventId)
                 fh.close()
             except OSError as err:
                 raise EventDaemonError(
@@ -489,11 +537,20 @@ class Engine(object):
         - Load plugins from disk - see L{load} method.
         - Get new events from Shotgun
         - Loop through events
-        - Loop through each plugin
-        - Loop through each callback
-        - Send the callback an event
-        - Once all callbacks are done in all plugins, save the eventId
-        - Go to the next event
+        - Hand each event off to every active plugin's own worker thread -
+          see L{PluginCollection.process}. This does not wait for the
+          plugins to actually finish with the event: each plugin has a
+          persistent worker thread that consumes its own queue of events at
+          its own pace, independently of every other plugin. A plugin that
+          crashes or takes a long time on one event never blocks or delays
+          any other plugin, nor does it block the engine from moving on to
+          the next event.
+        - Once all events in the current batch have been handed off, save
+          whatever event id state has actually been processed so far (this
+          is a checkpoint for restart recovery - it may lag behind what's
+          been dispatched if some plugins are still working through their
+          queue, which is fine: on restart those events will simply be
+          redelivered).
         - Once all events are processed, wait for the defined fetch interval time and start over.
 
         Caveats:
@@ -510,7 +567,7 @@ class Engine(object):
             for event in events:
                 for collection in self._pluginCollections:
                     collection.process(event)
-                self._saveEventIdData()
+            self._saveEventIdData()
 
             # if we're lagging behind Shotgun, we received a full batch of events
             # skip the sleep() call in this case
@@ -604,10 +661,24 @@ class Engine(object):
             for colPath, state in self._eventIdData.items():
                 if state:
                     try:
-                        with open(eventIdFile, "wb") as fh:
+                        # Write to a temp file first, then atomically
+                        # replace the real one. A direct
+                        # open(eventIdFile, "wb") truncates it the
+                        # instant it's opened, before pickle.dump()
+                        # writes anything - a signal (Ctrl+C, SIGTERM)
+                        # or crash landing in that window leaves a
+                        # 0-byte file that raises EOFError on the next
+                        # startup. os.replace() is atomic: the real
+                        # file is only ever touched by the rename
+                        # itself, which either fully happens or
+                        # doesn't - an interrupted write only corrupts
+                        # the (discarded) temp file, never this one.
+                        tmpEventIdFile = eventIdFile + ".tmp"
+                        with open(tmpEventIdFile, "wb") as fh:
                             pickle.dump(
                                 self._eventIdData, fh, protocol=pickle.HIGHEST_PROTOCOL
                             )
+                        os.replace(tmpEventIdFile, eventIdFile)
                     except OSError as err:
                         self.log.error(
                             "Can not write event id data to %s.\n\n%s",
@@ -653,13 +724,6 @@ class PluginCollection(object):
         self._plugins = {}
         self._stateData = {}
 
-        # Thread pool used to process plugins concurrently. It is (re)built
-        # in load() so that its size always matches the number of loaded
-        # plugins unless the user has pinned a max_workers value in the
-        # config.
-        self._maxWorkers = self._engine.config.getPluginMaxWorkers()
-        self._executor = None
-
     def setState(self, state):
         if isinstance(state, int):
             for plugin in self:
@@ -690,88 +754,34 @@ class PluginCollection(object):
 
     def process(self, event):
         """
-        Dispatch C{event} to every active plugin in this collection.
+        Hand C{event} off to every active plugin in this collection.
 
-        Each plugin is run in its own worker thread so that a plugin which
-        crashes or takes a long time to complete cannot affect the main
-        thread or delay/block any other plugin. This call still blocks until
-        every plugin has finished processing the event (or crashed) before
-        returning, so event ordering and state persistence (see
-        L{Engine._saveEventIdData}) are preserved exactly like before.
+        This does not wait for the plugins to actually process the event.
+        Each plugin has its own persistent worker thread and its own queue
+        (see L{Plugin.enqueue}); this call only pushes the event onto that
+        queue and moves on. A plugin's worker thread processes its queue in
+        order, at its own pace, independently of every other plugin - so a
+        plugin that crashes or takes a long time on one event never blocks
+        or delays any other plugin, and never blocks this call or the main
+        thread. As soon as a plugin's worker thread finishes an event, and
+        there's nothing else already waiting in that plugin's queue, it is
+        immediately free to pick up the next event without waiting on any
+        of its siblings.
         """
-        activePlugins = []
         for plugin in self:
             if plugin.isActive():
-                activePlugins.append(plugin)
+                plugin.enqueue(event)
             else:
                 plugin.logger.debug("Skipping: inactive.")
 
-        if not activePlugins:
-            return
-
-        executor = self._getExecutor()
-
-        futures = {
-            executor.submit(self._processPlugin, plugin, event): plugin
-            for plugin in activePlugins
-        }
-
-        # Wait for every plugin to finish (successfully or not) before
-        # returning. Each plugin runs independently of the others, so one
-        # plugin crashing or running long does not hold up or take down its
-        # siblings - it only delays how long this call takes to return.
-        for future in concurrent.futures.as_completed(futures):
-            plugin = futures[future]
-            try:
-                future.result()
-            except Exception:
-                # This should be rare: Plugin.process()/Plugin._process()
-                # already contain their own error handling and deactivate
-                # themselves on failure. This is a last resort safety net so
-                # that a truly unexpected crash in a plugin thread can never
-                # propagate to (or kill) the main thread.
-                plugin.logger.critical(
-                    "Unhandled exception while processing event %d in "
-                    "plugin %s. The plugin has been deactivated.\n\n%s",
-                    event["id"],
-                    plugin.getName(),
-                    traceback.format_exc(),
-                )
-                plugin.deactivate()
-
-    @staticmethod
-    def _processPlugin(plugin, event):
-        """
-        Entry point run inside a worker thread for a single plugin.
-        """
-        plugin.process(event)
-
-    def _getExecutor(self):
-        """
-        Lazily create the thread pool executor used to process plugins
-        concurrently. Recreated in L{load} whenever the set of plugins
-        changes so its size always tracks the number of loaded plugins
-        (unless a fixed size was configured).
-        """
-        if self._executor is None:
-            self._executor = self._buildExecutor()
-        return self._executor
-
-    def _buildExecutor(self):
-        workerCount = self._maxWorkers or max(1, len(self._plugins))
-        return concurrent.futures.ThreadPoolExecutor(
-            max_workers=workerCount,
-            thread_name_prefix="Plugin-%s" % os.path.basename(self.path.rstrip(os.sep)),
-        )
-
     def shutdown(self):
         """
-        Stop accepting new work and wait for any in-flight plugin threads to
-        finish. Should be called when the engine is shutting down.
+        Stop every plugin's worker thread, waiting for any event currently
+        being processed to finish. Should be called when the engine is
+        shutting down.
         """
-        if self._executor is not None:
-            self._executor.shutdown(wait=True)
-            self._executor = None
+        for plugin in self:
+            plugin.shutdown()
 
     def load(self):
         """
@@ -798,17 +808,15 @@ class PluginCollection(object):
 
             newPlugins[basename].load()
 
-        pluginCountChanged = len(newPlugins) != len(self._plugins)
-        self._plugins = newPlugins
+        # Any plugin that disappeared from disk is no longer referenced and
+        # won't get new events, but its worker thread is still sitting there
+        # waiting on an empty queue. Shut those down explicitly so they don't
+        # leak.
+        for basename, plugin in self._plugins.items():
+            if basename not in newPlugins:
+                plugin.shutdown()
 
-        # Rebuild the thread pool if the number of plugins changed (and we
-        # aren't pinned to a fixed worker count) so every plugin always gets
-        # its own thread to run concurrently in.
-        if self._executor is not None and (
-            pluginCountChanged and self._maxWorkers is None
-        ):
-            self._executor.shutdown(wait=True)
-            self._executor = self._buildExecutor()
+        self._plugins = newPlugins
 
     def __iter__(self):
         for basename in sorted(self._plugins.keys()):
@@ -843,6 +851,37 @@ class Plugin(object):
         self._lastEventId = None
         self._backlog = {}
 
+        # Guards _callbacks/_active/_mtime, which are written by load() (on
+        # the main thread, whenever the plugin file changes on disk) and read
+        # by process()/_process() (on this plugin's worker thread, for every
+        # event). Without this a reload could swap _callbacks out from under
+        # a callback loop that's mid-iteration.
+        self._lock = threading.RLock()
+
+        # Each plugin gets its own queue and a single persistent worker
+        # thread that consumes it in order for as long as the plugin exists.
+        # This is what lets every plugin proceed at its own pace: a plugin
+        # stuck on a slow or crashing event only ever blocks itself, never
+        # the engine's main thread nor any other plugin's queue.
+        self._queue = queue.Queue()
+        self._stopSentinel = object()
+        self._workerThread = threading.Thread(
+            target=self._workerLoop,
+            name="Plugin-%s" % self._pluginName,
+            daemon=True,
+        )
+        self._workerThread.start()
+
+        # Highest event id handed to this plugin's queue so far (whether or
+        # not the worker thread has actually gotten to it yet). This drives
+        # what the engine fetches next from Shotgun - see
+        # getNextUnprocessedEventId() below - and is intentionally kept
+        # separate from _lastEventId, which only advances once an event has
+        # actually been processed. Using _lastEventId for that purpose would
+        # make the engine keep re-fetching and re-queuing events a lagging
+        # plugin hasn't gotten to yet, processing them twice.
+        self._lastDispatchedEventId = None
+
         # Setup the plugin's logger
         self.logger = logging.getLogger("plugin." + self.getName())
         self.logger.config = self._engine.config
@@ -857,19 +896,44 @@ class Plugin(object):
         return self._pluginName
 
     def setState(self, state):
-        if isinstance(state, int):
-            self._lastEventId = state
-        elif isinstance(state, tuple):
-            self._lastEventId, self._backlog = state
-        else:
-            raise ValueError("Unknown state type: %s." % type(state))
+        with self._lock:
+            if isinstance(state, int):
+                self._lastEventId = state
+            elif isinstance(state, tuple):
+                self._lastEventId, self._backlog = state
+            else:
+                raise ValueError("Unknown state type: %s." % type(state))
+
+            # Only seed the dispatch cursor the first time state is set (i.e.
+            # at startup, before anything has been dispatched this run).
+            # Later calls - e.g. Engine._loadEventIdData() re-applying
+            # whatever was last saved to disk - must not be allowed to drag
+            # it backwards, or we'd start re-queuing events this plugin is
+            # already working through.
+            if self._lastDispatchedEventId is None:
+                self._lastDispatchedEventId = self._lastEventId
 
     def getState(self):
-        return (self._lastEventId, self._backlog)
+        with self._lock:
+            # Return a snapshot (not a live reference) of _backlog: this is
+            # handed off to Engine._saveEventIdData(), which pickles it after
+            # we've released the lock, while this plugin's worker thread may
+            # still be concurrently mutating the real dict.
+            return (self._lastEventId, dict(self._backlog))
 
     def getNextUnprocessedEventId(self):
-        if self._lastEventId:
-            nextId = self._lastEventId + 1
+        """
+        Next event id the engine should fetch from Shotgun for this plugin.
+
+        This is a dispatch cursor, not a "fully processed" cursor: it
+        reflects what's already been queued for this plugin, which may be
+        ahead of what its worker thread has actually gotten around to. That
+        distinction is what allows the worker thread to lag behind without
+        the engine re-fetching and re-queuing the same events on every pass
+        through the main loop.
+        """
+        if self._lastDispatchedEventId:
+            nextId = self._lastDispatchedEventId + 1
         else:
             nextId = None
 
@@ -900,6 +964,58 @@ class Plugin(object):
         """
         self._active = False
 
+    def enqueue(self, event):
+        """
+        Queue C{event} up for this plugin's worker thread to process.
+
+        Returns immediately - this never waits for the event to actually be
+        processed.
+        """
+        self._lastDispatchedEventId = event["id"]
+        self._queue.put(event)
+
+    def shutdown(self):
+        """
+        Ask this plugin's worker thread to stop once its queue is drained,
+        and wait for it to do so.
+        """
+        if self._workerThread.is_alive():
+            self._queue.put(self._stopSentinel)
+            self._workerThread.join()
+
+    def _workerLoop(self):
+        """
+        Entry point for this plugin's dedicated worker thread.
+
+        Pulls events off this plugin's queue one at a time, in order, for as
+        long as the plugin exists. As soon as one event is done, if there's
+        another already waiting in the queue, it's picked up immediately -
+        this thread never waits around for any other plugin.
+        """
+        while True:
+            item = self._queue.get()
+            try:
+                if item is self._stopSentinel:
+                    return
+
+                event = item
+                try:
+                    self.process(event)
+                except Exception:
+                    # Plugin.process()/_process() already isolate and log
+                    # callback-level errors on their own. This is a last
+                    # resort safety net so that a truly unexpected crash can
+                    # never escape this thread and take down anything else.
+                    self.logger.critical(
+                        "Unhandled exception while processing event %d. "
+                        "The plugin has been deactivated.\n\n%s",
+                        event["id"],
+                        traceback.format_exc(),
+                    )
+                    self.deactivate()
+            finally:
+                self._queue.task_done()
+
     def setEmails(self, *emails):
         """
         Set the email addresses to whom this plugin should send errors.
@@ -925,6 +1041,11 @@ class Plugin(object):
 
         At every step along the way, if any error occurs the whole plugin will
         be deactivated and the function will return.
+
+        This can run concurrently with this plugin's worker thread handling
+        an event (see L{_workerLoop}/L{process}), so every mutation here is
+        guarded by C{self._lock}, which C{_process} also holds while it reads
+        C{_callbacks}/C{_active}.
         """
         # Check file mtime
         mtime = os.path.getmtime(self._path)
@@ -936,38 +1057,39 @@ class Plugin(object):
             # The mtime of file is equal or older. We don't need to do anything.
             return
 
-        # Reset values
-        self._mtime = mtime
-        self._callbacks = []
-        self._active = True
+        with self._lock:
+            # Reset values
+            self._mtime = mtime
+            self._callbacks = []
+            self._active = True
 
-        try:
-            plugin = importlib_wrapper.load_source(self._pluginName, self._path)
-        except:
-            self._active = False
-            self.logger.error(
-                "Could not load the plugin at %s.\n\n%s",
-                self._path,
-                traceback.format_exc(),
-            )
-            return
-
-        regFunc = getattr(plugin, "registerCallbacks", None)
-        if callable(regFunc):
             try:
-                regFunc(Registrar(self))
+                plugin = importlib_wrapper.load_source(self._pluginName, self._path)
             except:
-                self._engine.log.critical(
-                    "Error running register callback function from plugin at %s.\n\n%s",
+                self._active = False
+                self.logger.error(
+                    "Could not load the plugin at %s.\n\n%s",
                     self._path,
                     traceback.format_exc(),
                 )
+                return
+
+            regFunc = getattr(plugin, "registerCallbacks", None)
+            if callable(regFunc):
+                try:
+                    regFunc(Registrar(self))
+                except:
+                    self._engine.log.critical(
+                        "Error running register callback function from plugin at %s.\n\n%s",
+                        self._path,
+                        traceback.format_exc(),
+                    )
+                    self._active = False
+            else:
+                self._engine.log.critical(
+                    "Did not find a registerCallbacks function in plugin at %s.", self._path
+                )
                 self._active = False
-        else:
-            self._engine.log.critical(
-                "Did not find a registerCallbacks function in plugin at %s.", self._path
-            )
-            self._active = False
 
     def registerCallback(
         self,
@@ -1001,36 +1123,38 @@ class Plugin(object):
         )
 
     def process(self, event):
-        if event["id"] in self._backlog:
-            if self._process(event):
-                self.logger.info("Processed id %d from backlog." % event["id"])
-                del self._backlog[event["id"]]
-                self._updateLastEventId(event)
-        elif self._lastEventId is not None and event["id"] <= self._lastEventId:
-            msg = "Event %d is too old. Last event processed was (%d)."
-            self.logger.debug(msg, event["id"], self._lastEventId)
-        else:
-            if self._process(event):
-                self._updateLastEventId(event)
+        with self._lock:
+            if event["id"] in self._backlog:
+                if self._process(event):
+                    self.logger.info("Processed id %d from backlog." % event["id"])
+                    del self._backlog[event["id"]]
+                    self._updateLastEventId(event)
+            elif self._lastEventId is not None and event["id"] <= self._lastEventId:
+                msg = "Event %d is too old. Last event processed was (%d)."
+                self.logger.debug(msg, event["id"], self._lastEventId)
+            else:
+                if self._process(event):
+                    self._updateLastEventId(event)
 
-        return self._active
+            return self._active
 
     def _process(self, event):
-        for callback in self:
-            if callback.isActive():
-                if callback.canProcess(event):
-                    msg = "Dispatching event %d to callback %s."
-                    self.logger.debug(msg, event["id"], str(callback))
-                    if not callback.process(event):
-                        # A callback in the plugin failed. Deactivate the whole
-                        # plugin.
-                        self._active = False
-                        break
-            else:
-                msg = "Skipping inactive callback %s in plugin."
-                self.logger.debug(msg, str(callback))
+        with self._lock:
+            for callback in self:
+                if callback.isActive():
+                    if callback.canProcess(event):
+                        msg = "Dispatching event %d to callback %s."
+                        self.logger.debug(msg, event["id"], str(callback))
+                        if not callback.process(event):
+                            # A callback in the plugin failed. Deactivate the whole
+                            # plugin.
+                            self._active = False
+                            break
+                else:
+                    msg = "Skipping inactive callback %s in plugin."
+                    self.logger.debug(msg, str(callback))
 
-        return self._active
+            return self._active
 
     def _updateLastEventId(self, event):
         BACKLOG_TIMEOUT = (
@@ -1444,6 +1568,14 @@ def main():
 
     if action:
         daemon = LinuxDaemon()
+
+    if action:
+        try:
+            slack_msj.send_slack_message(
+                "Boxel Server: Executing shotgunEventDaemon action: {}".format(action))
+        except Exception as e:
+            pass  # Ignore Slack errors
+
 
         # Find the function to call on the daemon and call it
         func = getattr(daemon, action, None)
