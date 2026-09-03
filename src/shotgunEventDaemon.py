@@ -28,6 +28,7 @@ __version_info__ = (1, 0)
 
 import concurrent.futures
 import datetime
+import threading
 import logging
 import logging.handlers
 import os
@@ -38,6 +39,23 @@ import time
 import traceback
 import configparser
 import pickle
+
+#
+# BOXEL Customizations
+#
+print("Boxel adding third party modules")
+packages = r"/srv/shotgunEvents-master/src/site-packages"
+if packages not in sys.path:
+    sys.path.append(packages)
+
+print("Boxel adding triggers modules")
+sys.path.append(r"/srv/shotgunEvents-master/src/bxl_triggers")
+
+# Boxel modules
+from bxl_triggers.common import slack_msj
+
+from distutils.version import StrictVersion
+
 
 if sys.platform == "win32":
     import win32serviceutil
@@ -372,9 +390,27 @@ class Engine(object):
             self._mainLoop()
         except KeyboardInterrupt:
             self.log.warning("Keyboard interrupt. Cleaning up...")
+            # Fire-and-forget: a blocking send_slack_message() call
+            # here would hold up shutdown itself if Slack (or the
+            # network) is slow to respond, forcing a second Ctrl+C to
+            # actually kill the process instead of exiting cleanly -
+            # observed directly once already (the traceback showed
+            # this call still stuck in sock.connect() when the second
+            # KeyboardInterrupt landed).
+            threading.Thread(
+                target=slack_msj.send_slack_message,
+                args=("Boxel site: Daemon stopped by user.",),
+                daemon=True,
+            ).start()
         except Exception as err:
             msg = "Crash!!!!! Unexpected error (%s) in main loop.\n\n%s"
             self.log.critical(msg, type(err), traceback.format_exc())
+
+            threading.Thread(
+                target=slack_msj.send_slack_message,
+                args=(msg % (type(err), traceback.format_exc()),),
+                daemon=True,
+            ).start()
 
     def _loadEventIdData(self):
         """
@@ -444,6 +480,29 @@ class Engine(object):
                         self.log.debug(
                             "Read last event id (%d) from file.", lastEventId
                         )
+                        for collection in self._pluginCollections:
+                            collection.setState(lastEventId)
+                except EOFError:
+                    # The file exists but is completely empty - e.g. a
+                    # previous run was killed (Ctrl+C, SIGTERM, crash)
+                    # between _saveEventIdData() truncating the file
+                    # and pickle.dump() actually writing to it. There's
+                    # no legacy int to recover here (nothing at all to
+                    # read), so treat this exactly like a missing file:
+                    # fall back to the latest event id in Shotgun
+                    # instead of silently leaving every collection
+                    # with no starting point, which would make
+                    # _getNewEvents() never fetch anything at all.
+                    fh.close()
+                    self.log.warning(
+                        "Event id file %s exists but is empty (likely "
+                        "left behind by an interrupted write) - "
+                        "falling back to the latest event id in "
+                        "Shotgun.",
+                        eventIdFile,
+                    )
+                    lastEventId = self._getLastEventIdFromDatabase()
+                    if lastEventId:
                         for collection in self._pluginCollections:
                             collection.setState(lastEventId)
                 fh.close()
@@ -604,10 +663,24 @@ class Engine(object):
             for colPath, state in self._eventIdData.items():
                 if state:
                     try:
-                        with open(eventIdFile, "wb") as fh:
+                        # Write to a temp file first, then atomically
+                        # replace the real one. A direct
+                        # open(eventIdFile, "wb") truncates it the
+                        # instant it's opened, before pickle.dump()
+                        # writes anything - a signal (Ctrl+C, SIGTERM)
+                        # or crash landing in that window leaves a
+                        # 0-byte file that raises EOFError on the next
+                        # startup. os.replace() is atomic: the real
+                        # file is only ever touched by the rename
+                        # itself, which either fully happens or
+                        # doesn't - an interrupted write only corrupts
+                        # the (discarded) temp file, never this one.
+                        tmpEventIdFile = eventIdFile + ".tmp"
+                        with open(tmpEventIdFile, "wb") as fh:
                             pickle.dump(
                                 self._eventIdData, fh, protocol=pickle.HIGHEST_PROTOCOL
                             )
+                        os.replace(tmpEventIdFile, eventIdFile)
                     except OSError as err:
                         self.log.error(
                             "Can not write event id data to %s.\n\n%s",
@@ -1444,6 +1517,14 @@ def main():
 
     if action:
         daemon = LinuxDaemon()
+
+    if action:
+        try:
+            slack_msj.send_slack_message(
+                "Boxel Server: Executing shotgunEventDaemon action: {}".format(action))
+        except Exception as e:
+            pass  # Ignore Slack errors
+
 
         # Find the function to call on the daemon and call it
         func = getattr(daemon, action, None)
