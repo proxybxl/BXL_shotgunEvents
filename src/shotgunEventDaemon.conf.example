@@ -62,6 +62,44 @@ fetch_interval = 5
 max_event_batch_size = 500
 
 
+[database_log]
+# Log each plugin worker-thread execution to MariaDB, in addition to the file
+# logging configured above (file logging is not replaced or migrated).
+# One row is written per (event_id, plugin) run with start time, duration,
+# completion time, and captured plugin logger output.
+#
+# Create the tables first:
+#   mysql -u root -p < sql/plugin_event_log.sql
+#
+# Writes go to a MEMORY buffer table (plugin_event_log_mem) so hundreds of
+# inserts per second do not wait on disk. Every 15 minutes (and on shutdown)
+# the daemon copies complete rows -- including full plugin output -- to the
+# InnoDB archive table (plugin_event_log) and truncates the buffer.
+enabled: False
+
+host: localhost
+port: 3306
+database: shotgun_events
+user: shotgun_events
+password: change_me
+
+# Seconds between MEMORY -> InnoDB flushes. 900 = 15 minutes.
+# flush_interval_seconds: 900
+
+# Rows batched into each INSERT against the MEMORY table.
+# batch_size: 100
+
+# Max queued plugin runs waiting to be written. Extra runs are dropped.
+# queue_maxsize: 50000
+
+# Cap captured plugin logger output stored in the archive (characters).
+# max_output_chars: 1048576
+
+# Set to False only if you enable the MariaDB EVENT in plugin_event_log.sql
+# instead of letting the daemon flush. Do not run both or rows will duplicate.
+# flush_in_daemon: True
+
+
 [shotgun]
 # Shotgun connection options for the daemon
 
