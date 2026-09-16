@@ -64,6 +64,7 @@ if sys.platform == "win32":
     import servicemanager
 
 import daemonizer
+import db_logger
 import shotgun_api3 as sg
 from shotgun_api3.lib.sgtimezone import SgTimezone
 
@@ -257,6 +258,13 @@ class Config(configparser.ConfigParser):
 
         return self.getLogFile() + ".timing"
 
+    def getDatabaseLogEnabled(self):
+        if not self.has_section("database_log"):
+            return False
+        if not self.has_option("database_log", "enabled"):
+            return False
+        return self.getboolean("database_log", "enabled")
+
 
 class Engine(object):
     """
@@ -267,6 +275,7 @@ class Engine(object):
         """ """
         self._continue = True
         self._eventIdData = {}
+        self.db_logger = None
 
         # Read/parse the config
         self.config = Config(configPath)
@@ -314,6 +323,19 @@ class Engine(object):
             _setFilePathOnLogger(self.timing_logger, timing_log_filename)
         else:
             self.timing_logger = None
+
+        # Database logging is additive: file logging above is left unchanged.
+        self.db_logger = None
+        if self.config.getDatabaseLogEnabled():
+            try:
+                self.db_logger = db_logger.DatabaseLogger(self.config, self.log)
+                self.db_logger.start()
+            except Exception:
+                self.log.error(
+                    "Failed to start database logging; continuing with file logging only.\n\n%s",
+                    traceback.format_exc(),
+                )
+                self.db_logger = None
 
         super().__init__()
 
@@ -587,6 +609,9 @@ class Engine(object):
         self._continue = False
         for collection in self._pluginCollections:
             collection.shutdown()
+        if self.db_logger is not None:
+            self.db_logger.shutdown()
+            self.db_logger = None
 
     def _getNewEvents(self):
         """
@@ -892,6 +917,12 @@ class Plugin(object):
                 self.logger, self._engine.config.getLogFile("plugin." + self.getName())
             )
 
+        # Capture this plugin's log output (and callback child loggers) for
+        # the database log. File handlers already attached above are unchanged.
+        self._db_output_handler = None
+        if self._engine.db_logger is not None:
+            self._db_output_handler = self._engine.db_logger.attach_capture(self.logger)
+
     def getName(self):
         return self._pluginName
 
@@ -1123,20 +1154,49 @@ class Plugin(object):
         )
 
     def process(self, event):
-        with self._lock:
-            if event["id"] in self._backlog:
-                if self._process(event):
-                    self.logger.info("Processed id %d from backlog." % event["id"])
-                    del self._backlog[event["id"]]
-                    self._updateLastEventId(event)
-            elif self._lastEventId is not None and event["id"] <= self._lastEventId:
-                msg = "Event %d is too old. Last event processed was (%d)."
-                self.logger.debug(msg, event["id"], self._lastEventId)
-            else:
-                if self._process(event):
-                    self._updateLastEventId(event)
+        db_logger_obj = self._engine.db_logger
+        started_at = None
+        if db_logger_obj is not None:
+            started_at = datetime.datetime.now(datetime.timezone.utc).replace(
+                tzinfo=None
+            )
+            if self._db_output_handler is not None:
+                self._db_output_handler.begin()
 
-            return self._active
+        try:
+            with self._lock:
+                if event["id"] in self._backlog:
+                    if self._process(event):
+                        self.logger.info("Processed id %d from backlog." % event["id"])
+                        del self._backlog[event["id"]]
+                        self._updateLastEventId(event)
+                elif self._lastEventId is not None and event["id"] <= self._lastEventId:
+                    msg = "Event %d is too old. Last event processed was (%d)."
+                    self.logger.debug(msg, event["id"], self._lastEventId)
+                else:
+                    if self._process(event):
+                        self._updateLastEventId(event)
+
+                return self._active
+        finally:
+            if db_logger_obj is not None:
+                completed_at = datetime.datetime.now(datetime.timezone.utc).replace(
+                    tzinfo=None
+                )
+                duration_us = int(
+                    (completed_at - started_at).total_seconds() * 1_000_000
+                )
+                output = None
+                if self._db_output_handler is not None:
+                    output = self._db_output_handler.finish()
+                db_logger_obj.log_plugin_run(
+                    event["id"],
+                    self.getName(),
+                    started_at,
+                    duration_us,
+                    completed_at,
+                    output,
+                )
 
     def _process(self, event):
         with self._lock:
