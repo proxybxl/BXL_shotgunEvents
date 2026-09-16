@@ -917,8 +917,12 @@ class Plugin(object):
                 self.logger, self._engine.config.getLogFile("plugin." + self.getName())
             )
 
+        self._db_event_log = False
+        self._last_run_invoked = False
+        self._last_run_had_error = False
+
         # Capture this plugin's log output (and callback child loggers) for
-        # the database log. File handlers already attached above are unchanged.
+        # the database event log. File handlers already attached above are unchanged.
         self._db_output_handler = None
         if self._engine.db_logger is not None:
             self._db_output_handler = self._engine.db_logger.attach_capture(self.logger)
@@ -1056,6 +1060,20 @@ class Plugin(object):
         """
         self._engine.setEmailsOnLogger(self.logger, emails)
 
+    def enableDatabaseEventLog(self, enabled=True):
+        """
+        Record this plugin's per-event output in the database event log.
+
+        Errors are always stored, for every plugin. Call this from
+        C{registerCallbacks} to also store successful runs and their logger
+        output. Default is off.
+
+        @param enabled: True to persist per-event output, False to keep only
+            errors (and per-minute stats).
+        @type enabled: I{bool}
+        """
+        self._db_event_log = bool(enabled)
+
     def load(self):
         """
         Load/Reload the plugin and all its callbacks.
@@ -1093,6 +1111,7 @@ class Plugin(object):
             self._mtime = mtime
             self._callbacks = []
             self._active = True
+            self._db_event_log = False
 
             try:
                 plugin = importlib_wrapper.load_source(self._pluginName, self._path)
@@ -1156,11 +1175,17 @@ class Plugin(object):
     def process(self, event):
         db_logger_obj = self._engine.db_logger
         started_at = None
+        self._last_run_invoked = False
+        self._last_run_had_error = False
         if db_logger_obj is not None:
             started_at = datetime.datetime.now(datetime.timezone.utc).replace(
                 tzinfo=None
             )
             if self._db_output_handler is not None:
+                if self._db_event_log:
+                    self._db_output_handler.setLevel(logging.NOTSET)
+                else:
+                    self._db_output_handler.setLevel(logging.ERROR)
                 self._db_output_handler.begin()
 
         try:
@@ -1179,16 +1204,19 @@ class Plugin(object):
 
                 return self._active
         finally:
-            if db_logger_obj is not None:
+            output = None
+            if self._db_output_handler is not None:
+                output = self._db_output_handler.finish()
+            if db_logger_obj is not None and (
+                self._last_run_invoked or self._last_run_had_error
+            ):
                 completed_at = datetime.datetime.now(datetime.timezone.utc).replace(
                     tzinfo=None
                 )
                 duration_us = int(
                     (completed_at - started_at).total_seconds() * 1_000_000
                 )
-                output = None
-                if self._db_output_handler is not None:
-                    output = self._db_output_handler.finish()
+                had_error = self._last_run_had_error
                 db_logger_obj.log_plugin_run(
                     event["id"],
                     self.getName(),
@@ -1196,24 +1224,33 @@ class Plugin(object):
                     duration_us,
                     completed_at,
                     output,
+                    had_error=had_error,
+                    event_log=self._db_event_log or had_error,
                 )
 
     def _process(self, event):
         with self._lock:
+            invoked = False
+            had_error = False
             for callback in self:
                 if callback.isActive():
                     if callback.canProcess(event):
+                        invoked = True
                         msg = "Dispatching event %d to callback %s."
                         self.logger.debug(msg, event["id"], str(callback))
                         if not callback.process(event):
                             # A callback in the plugin failed. Deactivate the whole
                             # plugin.
+                            had_error = had_error or callback._had_error
                             self._active = False
                             break
+                        had_error = had_error or callback._had_error
                 else:
                     msg = "Skipping inactive callback %s in plugin."
                     self.logger.debug(msg, str(callback))
 
+            self._last_run_invoked = invoked
+            self._last_run_had_error = had_error
             return self._active
 
     def _updateLastEventId(self, event):
@@ -1275,7 +1312,12 @@ class Registrar(object):
         Wrap a plugin so it can be passed to a user.
         """
         self._plugin = plugin
-        self._allowed = ["logger", "setEmails", "registerCallback"]
+        self._allowed = [
+            "logger",
+            "setEmails",
+            "registerCallback",
+            "enableDatabaseEventLog",
+        ]
 
     def getLogger(self):
         """
@@ -1340,6 +1382,7 @@ class Callback(object):
         self._args = args
         self._stopOnError = stopOnError
         self._active = True
+        self._had_error = False
 
         # Find a name for this object
         if hasattr(callback, "__name__"):
@@ -1390,12 +1433,14 @@ class Callback(object):
         if self._engine._use_session_uuid:
             self._shotgun.set_session_uuid(event["session_uuid"])
 
+        self._had_error = False
+
         if self._engine.timing_logger:
             start_time = datetime.datetime.now(SG_TIMEZONE.local)
 
+        error = False
         try:
             self._callback(self._shotgun, self._logger, event, self._args)
-            error = False
         except:
             error = True
 
@@ -1431,6 +1476,7 @@ class Callback(object):
             ]
             self._engine.timing_logger.info(msg_format, *data)
 
+        self._had_error = error
         return self._active
 
     def _prettyTimeDeltaFormat(self, time_delta):
