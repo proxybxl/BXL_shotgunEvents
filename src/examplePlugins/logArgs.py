@@ -36,6 +36,10 @@ def registerCallbacks(reg):
     #   appropriate
     # - Argument to pass through to the callable
     #
+    # Persist this plugin's per-event logger output in MariaDB (errors are
+    # always stored for every plugin; this records successful runs too).
+    # reg.enableDatabaseEventLog()
+    #
     # eventFilter = {'Shotgun_Task_Change': ['sg_status_list']}
     eventFilter = None
     reg.registerCallback(

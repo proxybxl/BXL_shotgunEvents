@@ -1,39 +1,61 @@
 """
 MariaDB logging for plugin/thread executions.
 
-File logging is unchanged. This module writes one row per (event, plugin)
-worker-thread run into a MEMORY buffer table and periodically copies complete
-rows (including full plugin output) to an InnoDB archive table.
+File logging is unchanged. Every invoked callback run is stored as a compact
+sample in a MEMORY table. Once a minute those samples are aggregated per
+plugin into plugin_run_stats (run count, error count, min/avg/max duration)
+and the buffer is truncated.
+
+A row is written to plugin_event_log only when a callback errors, or when
+the plugin has called L{Plugin.enableDatabaseEventLog}.
 """
 
 import datetime
 import logging
 import queue
 import threading
+import time
 import traceback
 
-# Must match VARCHAR(4096) on plugin_event_log_mem in sql/plugin_event_log.sql
-MEMORY_OUTPUT_MAX_CHARS = 4096
+# MySQL/MariaDB ER_RECORD_FILE_FULL: MEMORY table exceeded max_heap_table_size.
+_ERROR_TABLE_FULL = 1114
 
 _INSERT_MEM_SQL = (
     "INSERT INTO plugin_event_log_mem "
-    "(event_id, plugin_name, started_at, duration_us, completed_at, plugin_output) "
-    "VALUES (%s, %s, %s, %s, %s, %s)"
+    "(plugin_name, duration_us, had_error) "
+    "VALUES (%s, %s, %s)"
 )
 
-_INSERT_DISK_SQL = (
+_INSERT_EVENT_SQL = (
     "INSERT INTO plugin_event_log "
-    "(event_id, plugin_name, started_at, duration_us, completed_at, plugin_output) "
-    "VALUES (%s, %s, %s, %s, %s, %s)"
+    "(event_id, plugin_name, started_at, duration_us, completed_at, "
+    "had_error, log_reason, plugin_output) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
 )
 
 _TRUNCATE_MEM_SQL = "TRUNCATE TABLE plugin_event_log_mem"
 
-_FLUSH_MEM_TO_DISK_SQL = (
-    "INSERT INTO plugin_event_log "
-    "(event_id, plugin_name, started_at, duration_us, completed_at, plugin_output) "
-    "SELECT event_id, plugin_name, started_at, duration_us, completed_at, plugin_output "
-    "FROM plugin_event_log_mem"
+_AGGREGATE_MEM_SQL = (
+    "INSERT INTO plugin_run_stats ("
+    "period_start, plugin_name, run_count, error_count, "
+    "duration_us_min, duration_us_max, duration_us_sum, duration_us_avg"
+    ") "
+    "SELECT "
+    "%s, plugin_name, COUNT(*), COALESCE(SUM(had_error), 0), "
+    "MIN(duration_us), MAX(duration_us), SUM(duration_us), "
+    "ROUND(AVG(duration_us)) "
+    "FROM plugin_event_log_mem "
+    "GROUP BY plugin_name "
+    "ON DUPLICATE KEY UPDATE "
+    "duration_us_avg = ROUND("
+    "(duration_us_sum + VALUES(duration_us_sum)) "
+    "/ (run_count + VALUES(run_count))"
+    "), "
+    "run_count = run_count + VALUES(run_count), "
+    "error_count = error_count + VALUES(error_count), "
+    "duration_us_min = LEAST(duration_us_min, VALUES(duration_us_min)), "
+    "duration_us_max = GREATEST(duration_us_max, VALUES(duration_us_max)), "
+    "duration_us_sum = duration_us_sum + VALUES(duration_us_sum)"
 )
 
 
@@ -93,14 +115,28 @@ def _truncate_output(output, max_chars):
     return output
 
 
+def _is_table_full(err):
+    args = getattr(err, "args", ())
+    if args and args[0] == _ERROR_TABLE_FULL:
+        return True
+    return "is full" in str(err).lower()
+
+
+def _period_start(dt=None):
+    if dt is None:
+        dt = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    else:
+        dt = _naive_utc(dt)
+    return dt.replace(second=0, microsecond=0)
+
+
 class DatabaseLogger(object):
     """
-    Non-blocking logger that records plugin/thread executions to MariaDB.
+    Non-blocking logger for per-minute plugin stats and sparse event logs.
 
-    Plugin worker threads call L{log_plugin_run}, which only enqueues a row.
-    A dedicated writer thread batch-inserts into the MEMORY buffer table. A
-    flusher thread (or L{flush_to_disk} on shutdown) copies complete rows to
-    the InnoDB archive and truncates the buffer.
+    Plugin worker threads call L{log_plugin_run}, which only enqueues. A
+    writer thread inserts compact samples into MEMORY and event rows into
+    InnoDB. A flusher aggregates MEMORY into plugin_run_stats each minute.
 
     Database failures never propagate to callers.
     """
@@ -133,12 +169,12 @@ class DatabaseLogger(object):
         self._flush_interval = (
             config.getint("database_log", "flush_interval_seconds")
             if config.has_option("database_log", "flush_interval_seconds")
-            else 900
+            else 60
         )
         self._batch_size = (
             config.getint("database_log", "batch_size")
             if config.has_option("database_log", "batch_size")
-            else 100
+            else 1000
         )
         self._queue_max = (
             config.getint("database_log", "queue_maxsize")
@@ -153,29 +189,32 @@ class DatabaseLogger(object):
         self._flush_in_daemon = True
         if config.has_option("database_log", "flush_in_daemon"):
             self._flush_in_daemon = config.getboolean("database_log", "flush_in_daemon")
+        self._flush_row_threshold = (
+            config.getint("database_log", "flush_row_threshold")
+            if config.has_option("database_log", "flush_row_threshold")
+            else 250000
+        )
 
         self._queue = queue.Queue(maxsize=self._queue_max)
         self._wakeup = object()
-        self._archive = []
         self._db_lock = threading.Lock()
         self._stop = threading.Event()
         self._conn = None
         self._dropped = 0
+        self._mem_rows = 0
+        self._window_started_at = None
         self._writer_thread = None
-        self._flush_thread = None
 
     def start(self):
-        """Open the DB connection and start writer/flusher threads."""
-        self._conn = self._open_connection()
+        """Start the writer thread. The MySQL connection is opened on that thread."""
+        if self._writer_thread is not None and self._writer_thread.is_alive():
+            return
+        self._stop.clear()
+        self._window_started_at = _period_start()
         self._writer_thread = threading.Thread(
             target=self._writer_loop, name="DatabaseLogger-writer", daemon=True
         )
         self._writer_thread.start()
-        if self._flush_in_daemon:
-            self._flush_thread = threading.Thread(
-                target=self._flush_loop, name="DatabaseLogger-flush", daemon=True
-            )
-            self._flush_thread.start()
         self._logger.info(
             "Database logging started (host=%s db=%s flush_interval=%ss).",
             self._host,
@@ -204,27 +243,38 @@ class DatabaseLogger(object):
         duration_us,
         completed_at,
         plugin_output=None,
+        had_error=False,
+        event_log=False,
     ):
         """
-        Enqueue one plugin/thread execution. Never blocks the caller for I/O.
+        Enqueue one invoked plugin run. Never blocks the caller for I/O.
 
-        @param event_id: Shotgun event id.
-        @param plugin_name: Plugin file stem (no path, no .py).
-        @param started_at: When the plugin worker began this event.
-        @param duration_us: Execution duration in microseconds.
-        @param completed_at: When the plugin worker finished this event.
-        @param plugin_output: Captured logger output, or None.
+        A compact timing sample is always queued for the per-minute stats
+        buffer. An event-log row is queued only when C{had_error} or
+        C{event_log} is true.
         """
         try:
-            row = (
-                int(event_id),
-                plugin_name,
-                _naive_utc(started_at),
-                int(duration_us),
-                _naive_utc(completed_at),
-                _truncate_output(plugin_output, self._max_output_chars),
+            duration_us = int(duration_us)
+            had_error = 1 if had_error else 0
+            event_row = None
+            if had_error or event_log:
+                reason = "error" if had_error else "plugin"
+                event_row = (
+                    int(event_id),
+                    plugin_name,
+                    _naive_utc(started_at),
+                    duration_us,
+                    _naive_utc(completed_at),
+                    had_error,
+                    reason,
+                    _truncate_output(plugin_output, self._max_output_chars),
+                )
+            self._queue.put_nowait(
+                {
+                    "stat": (plugin_name, duration_us, had_error),
+                    "event": event_row,
+                }
             )
-            self._queue.put_nowait(row)
         except queue.Full:
             self._dropped += 1
             if self._dropped == 1 or self._dropped % 1000 == 0:
@@ -241,7 +291,7 @@ class DatabaseLogger(object):
             )
 
     def shutdown(self):
-        """Stop threads, drain the queue, flush remaining rows to disk."""
+        """Stop the writer thread, which drains the queue and flushes stats."""
         self._stop.set()
         try:
             self._queue.put_nowait(self._wakeup)
@@ -249,19 +299,6 @@ class DatabaseLogger(object):
             pass
         if self._writer_thread is not None:
             self._writer_thread.join(timeout=30)
-        if self._flush_thread is not None:
-            self._flush_thread.join(timeout=30)
-        try:
-            self._drain_queue_to_memory()
-            if self._flush_in_daemon:
-                self.flush_to_disk()
-        except Exception:
-            self._logger.error(
-                "Error while shutting down database logging.\n\n%s",
-                traceback.format_exc(),
-            )
-        finally:
-            self._close_connection()
         if self._dropped:
             self._logger.warning(
                 "Database logging dropped %d plugin run(s) because the queue was full.",
@@ -271,28 +308,26 @@ class DatabaseLogger(object):
 
     def flush_to_disk(self):
         """
-        Copy buffered rows to the InnoDB archive and truncate the MEMORY table.
-
-        Full plugin output is taken from the in-process archive (not the
-        truncated MEMORY VARCHAR) so LONGTEXT on disk is complete.
+        Aggregate MEMORY samples into plugin_run_stats and truncate the buffer.
         """
         with self._db_lock:
-            rows = self._archive
-            self._archive = []
-            if not rows:
-                self._truncate_memory()
-                return
+            period_start = self._window_started_at or _period_start()
+            sample_count = self._mem_rows
             try:
-                self._executemany(_INSERT_DISK_SQL, rows, chunk_size=500)
+                self._execute(_AGGREGATE_MEM_SQL, (period_start,))
                 self._truncate_memory()
-                self._logger.debug(
-                    "Flushed %d plugin run(s) to plugin_event_log.", len(rows)
-                )
+                self._mem_rows = 0
+                self._window_started_at = _period_start()
+                if sample_count:
+                    self._logger.info(
+                        "Aggregated %d plugin run sample(s) into "
+                        "plugin_run_stats for %s.",
+                        sample_count,
+                        period_start,
+                    )
             except Exception:
-                # Put rows back so the next flush can retry. Leave MEMORY as-is.
-                self._archive = rows + self._archive
                 self._logger.error(
-                    "Failed to flush plugin event log to disk.\n\n%s",
+                    "Failed to aggregate plugin event log to plugin_run_stats.\n\n%s",
                     traceback.format_exc(),
                 )
                 raise
@@ -334,24 +369,65 @@ class DatabaseLogger(object):
         return self._conn
 
     def _writer_loop(self):
+        # MySQLdb connections are not thread-safe and do not survive fork().
+        # Open the connection on this thread and do all SQL here.
+        try:
+            self._conn = self._open_connection()
+        except Exception:
+            self._logger.error(
+                "Database logger writer could not connect to MariaDB.\n\n%s",
+                traceback.format_exc(),
+            )
+            return
+        self._logger.info("Database logger writer connected.")
+        next_flush = time.monotonic() + self._flush_interval
         while not self._stop.is_set():
-            batch = self._collect_batch(timeout=1.0)
-            if batch:
-                self._write_batch(batch)
-        batch = self._collect_batch(timeout=0)
-        if batch:
-            self._write_batch(batch)
-
-    def _flush_loop(self):
-        while not self._stop.wait(self._flush_interval):
             try:
-                self._drain_queue_to_memory()
-                self.flush_to_disk()
+                remaining = next_flush - time.monotonic()
+                if self._flush_in_daemon and remaining <= 0:
+                    self.flush_to_disk()
+                    next_flush = time.monotonic() + self._flush_interval
+                    continue
+                timeout = 1.0
+                if self._flush_in_daemon:
+                    timeout = min(1.0, max(0.05, remaining))
+                batch = self._collect_batch(timeout=timeout)
+                if batch:
+                    self._write_batch(batch)
+                    if (
+                        self._flush_in_daemon
+                        and self._mem_rows >= self._flush_row_threshold
+                    ):
+                        self.flush_to_disk()
+                        next_flush = time.monotonic() + self._flush_interval
             except Exception:
                 self._logger.error(
-                    "Periodic database log flush failed.\n\n%s",
+                    "Database logger writer error; continuing.\n\n%s",
                     traceback.format_exc(),
                 )
+                try:
+                    self._reconnect()
+                except Exception:
+                    pass
+        batch = self._collect_batch(timeout=0)
+        if batch:
+            try:
+                self._write_batch(batch)
+            except Exception:
+                self._logger.error(
+                    "Database logger writer error while stopping.\n\n%s",
+                    traceback.format_exc(),
+                )
+        try:
+            if self._flush_in_daemon:
+                self.flush_to_disk()
+        except Exception:
+            self._logger.error(
+                "Database logger flush failed while stopping.\n\n%s",
+                traceback.format_exc(),
+            )
+        finally:
+            self._close_connection()
 
     def _collect_batch(self, timeout):
         batch = []
@@ -375,45 +451,62 @@ class DatabaseLogger(object):
         return batch
 
     def _write_batch(self, batch):
-        mem_rows = [self._memory_row(row) for row in batch]
+        if not batch:
+            return
+        stats = []
+        events = []
+        for item in batch:
+            stats.append(item["stat"])
+            if item.get("event"):
+                events.append(item["event"])
         try:
             with self._db_lock:
-                self._executemany(_INSERT_MEM_SQL, mem_rows)
-                self._archive.extend(batch)
-        except Exception:
+                if stats:
+                    self._executemany(_INSERT_MEM_SQL, stats)
+                    self._mem_rows += len(stats)
+                if events:
+                    self._executemany(_INSERT_EVENT_SQL, events, chunk_size=100)
+        except Exception as err:
+            if _is_table_full(err) and self._flush_in_daemon:
+                self._recover_table_full(stats, events)
+                return
             self._logger.error(
-                "Failed to insert %d plugin run(s) into plugin_event_log_mem.\n\n%s",
-                len(batch),
+                "Failed to insert plugin log batch (%d stats, %d events).\n\n%s",
+                len(stats),
+                len(events),
                 traceback.format_exc(),
             )
-            # Keep the full rows so a later flush still has something to archive
-            # even if MEMORY insert failed (e.g. table full). Try an emergency
-            # flush; if that also fails the rows stay in _archive.
-            with self._db_lock:
-                self._archive.extend(batch)
             if self._flush_in_daemon:
                 try:
                     self.flush_to_disk()
                 except Exception:
                     pass
 
-    def _drain_queue_to_memory(self):
+    def _recover_table_full(self, stats, events):
+        try:
+            self.flush_to_disk()
+            with self._db_lock:
+                if stats:
+                    self._executemany(_INSERT_MEM_SQL, stats)
+                    self._mem_rows += len(stats)
+                if events:
+                    self._executemany(_INSERT_EVENT_SQL, events, chunk_size=100)
+            self._logger.warning(
+                "plugin_event_log_mem was full (MySQL error 1114); aggregated "
+                "stats to plugin_run_stats and continued."
+            )
+        except Exception:
+            self._logger.error(
+                "plugin_event_log_mem is full and recovery failed.\n\n%s",
+                traceback.format_exc(),
+            )
+
+    def _drain_queue(self):
         while True:
             batch = self._collect_batch(timeout=0)
             if not batch:
                 return
             self._write_batch(batch)
-
-    def _memory_row(self, row):
-        event_id, plugin_name, started_at, duration_us, completed_at, output = row
-        return (
-            event_id,
-            plugin_name,
-            started_at,
-            duration_us,
-            completed_at,
-            _truncate_output(output, MEMORY_OUTPUT_MAX_CHARS),
-        )
 
     def _truncate_memory(self):
         self._execute(_TRUNCATE_MEM_SQL)
@@ -449,6 +542,8 @@ class DatabaseLogger(object):
                 return
             except Exception as err:
                 last_err = err
+                if _is_table_full(err):
+                    raise
                 try:
                     self._reconnect()
                 except Exception:
@@ -457,5 +552,5 @@ class DatabaseLogger(object):
 
 
 def flush_memory_table_sql():
-    """SQL used when MariaDB itself copies the MEMORY buffer to InnoDB."""
-    return _FLUSH_MEM_TO_DISK_SQL
+    """SQL used when MariaDB itself aggregates the MEMORY buffer to stats."""
+    return _AGGREGATE_MEM_SQL

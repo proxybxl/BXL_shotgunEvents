@@ -27,6 +27,7 @@ __version__ = "1.0"
 __version_info__ = (1, 0)
 
 import datetime
+import json
 import threading
 import logging
 import logging.handlers
@@ -39,6 +40,7 @@ import time
 import traceback
 import configparser
 import pickle
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 #
 # BOXEL Customizations
@@ -225,6 +227,24 @@ class Config(configparser.ConfigParser):
             return self.getint("daemon", "max_event_batch_size")
         return 500
 
+    def getPluginBacklogAlertThreshold(self):
+        """Pending-event count (dispatched but not yet processed) at
+        which a plugin is considered critically behind. Defaults to
+        twice the batch size - i.e. already two full fetch cycles
+        behind, not just briefly lagging within one."""
+        if self.has_option("daemon", "plugin_backlog_alert_threshold"):
+            return self.getint("daemon", "plugin_backlog_alert_threshold")
+        return self.getMaxEventBatchSize() * 2
+
+    def getPluginBacklogClearThreshold(self):
+        """Pending-event count below which a plugin's backlog alert is
+        cleared, allowing it to fire again later. Kept lower than the
+        alert threshold (hysteresis) so a count oscillating right at
+        one boundary doesn't spam repeated alerts."""
+        if self.has_option("daemon", "plugin_backlog_clear_threshold"):
+            return self.getint("daemon", "plugin_backlog_clear_threshold")
+        return int(self.getPluginBacklogAlertThreshold() * 0.7)
+
     def getLogFile(self, filename=None):
         if filename is None:
             if self.has_option("daemon", "logFile"):
@@ -277,6 +297,12 @@ class Engine(object):
         self._eventIdData = {}
         self.db_logger = None
 
+        # Populated once at startup by _loadDisabledEventLogScriptIds()
+        # (called from run(), after self._sg below exists) - empty here
+        # only as a safe default for anything that might run before
+        # that (e.g. tests constructing an Engine directly).
+        self._disabledEventLogScriptIds = set()
+
         # Read/parse the config
         self.config = Config(configPath)
 
@@ -324,15 +350,22 @@ class Engine(object):
         else:
             self.timing_logger = None
 
-        # Database logging is additive: file logging above is left unchanged.
+        # Constructed here so plugins can attach capture handlers; started in
+        # Engine.start() after daemonize() so the writer thread survives fork.
+        # __init__ runs in the pre-fork parent process (LinuxDaemon.__init__
+        # constructs the Engine before daemonizer.Daemon.start() forks) -
+        # threads started here would not exist in the post-fork daemon
+        # process at all (fork only carries over the calling thread), so
+        # db_logger.start()'s writer/flush threads have to wait until
+        # start() below, which runs after the fork, inside the real daemon
+        # process.
         self.db_logger = None
         if self.config.getDatabaseLogEnabled():
             try:
                 self.db_logger = db_logger.DatabaseLogger(self.config, self.log)
-                self.db_logger.start()
             except Exception:
                 self.log.error(
-                    "Failed to start database logging; continuing with file logging only.\n\n%s",
+                    "Failed to configure database logging; continuing with file logging only.\n\n%s",
                     traceback.format_exc(),
                 )
                 self.db_logger = None
@@ -392,10 +425,25 @@ class Engine(object):
         # Notify which version of shotgun api we are using
         self.log.info("Using SG Python API version %s" % sg.__version__)
 
+        # Runs here (not Engine.__init__) so the writer/flush threads are
+        # created in the actual daemon process, after daemonize()'s fork -
+        # see the comment in __init__ for why starting them any earlier
+        # would silently lose them.
+        if self.db_logger is not None:
+            try:
+                self.db_logger.start()
+            except Exception:
+                self.log.error(
+                    "Failed to start database logging; continuing with file logging only.\n\n%s",
+                    traceback.format_exc(),
+                )
+                self.db_logger = None
+
         try:
             for collection in self._pluginCollections:
                 collection.load()
 
+            self._loadDisabledEventLogScriptIds()
             self._loadEventIdData()
 
             self._mainLoop()
@@ -531,6 +579,55 @@ class Engine(object):
 
             self._saveEventIdData()
 
+    def _loadDisabledEventLogScriptIds(self):
+        """
+        One-time query, at daemon startup, for every ApiUser (Script)
+        with generate_event_log_entries disabled - the single source
+        of truth already maintained in Shotgun itself (each Script's
+        own checkbox), instead of a separately maintained list this
+        daemon's config would otherwise have to duplicate and keep in
+        sync by hand.
+
+        Used two ways:
+        - _getNewEvents() excludes these scripts' own (non-sudo)
+          writes directly in the EventLogEntry query, the same way
+          _getRegisteredEventTypes() excludes whole event types.
+        - isSuppressedSudoEvent() recognizes a sudo_as_login write
+          authored by one of them after the fact, via
+          event["meta"]["sudo_actual_user"] - generate_event_log_entries
+          is bypassed entirely for a sudo_as_login write (confirmed
+          live for one Script), so the query filter above can't catch
+          those; they can only be caught post-fetch.
+
+        Queried once at startup, not periodically: in practice a
+        script's generate_event_log_entries setting changes at the
+        same time as a trigger release, which already restarts this
+        daemon via the autopull/reload cycle - there's no realistic
+        window where the two drift apart.
+        """
+        conn_attempts = 0
+        while self._continue:
+            try:
+                scripts = self._sg.find(
+                    "ApiUser",
+                    [["generate_event_log_entries", "is", False]],
+                    ["id", "firstname"],
+                )
+            except (sg.ProtocolError, sg.ResponseError, socket.error) as err:
+                conn_attempts = self._checkConnectionAttempts(conn_attempts, str(err))
+            except Exception as err:
+                msg = "Unknown error: %s" % str(err)
+                conn_attempts = self._checkConnectionAttempts(conn_attempts, msg)
+            else:
+                self._disabledEventLogScriptIds = {s["id"] for s in scripts}
+                self.log.info(
+                    "%d script(s) with generate_event_log_entries "
+                    "disabled: %s",
+                    len(scripts),
+                    sorted(s.get("firstname") for s in scripts),
+                )
+                return
+
     def _getLastEventIdFromDatabase(self):
         conn_attempts = 0
         lastEventId = None
@@ -550,6 +647,69 @@ class Engine(object):
                 self.log.info("Last event id (%d) from the SG database.", lastEventId)
 
         return lastEventId
+
+    def _getRegisteredEventTypes(self):
+        """
+        Union of event_type strings some active plugin, in some
+        collection, currently registered a callback for - or None if
+        any callback anywhere matches every event type, in which case
+        _getNewEvents() must not filter by event_type at all.
+
+        Recomputed fresh on every call (cheap - purely in-memory,
+        no Shotgun round trip) rather than cached, since it must
+        reflect whatever collection.load() just picked up this same
+        _mainLoop() pass (a newly added or removed plugin file changes
+        this set immediately, not on the next restart).
+        """
+        event_types = set()
+        for collection in self._pluginCollections:
+            matched = collection.getMatchedEventTypes()
+            if matched is None:
+                return None
+            event_types.update(matched)
+        return event_types
+
+    def isSuppressedSudoEvent(self, event):
+        """
+        True if this event was authored via sudo_as_login by a Script
+        in _disabledEventLogScriptIds (see
+        _loadDisabledEventLogScriptIds).
+
+        generate_event_log_entries=False on a Script only suppresses
+        the events it logs acting as itself - _getNewEvents()'s
+        "user" not_in filter already handles that case in the query
+        itself. A sudo_as_login write bypasses that flag entirely
+        though: it still gets an EventLogEntry, attributed to the
+        sudo'd human as event["user"], with the actual Script recorded
+        separately in event["meta"]["sudo_actual_user"] (confirmed
+        live for one Script that has generate_event_log_entries
+        disabled). Since EventLogEntry.meta is a "serializable" (blob)
+        field - not queryable - this can't be excluded in the SG query;
+        it has to be checked here, after the event is already fetched.
+
+        Called from Plugin._process() so every plugin's own cursor/
+        backlog bookkeeping still advances normally for a suppressed
+        event (see _updateLastEventId) - only the callbacks' own work
+        is skipped, the same as if canProcess() had returned False for
+        all of them.
+        """
+        if not self._disabledEventLogScriptIds:
+            return False
+
+        meta = event.get("meta")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (TypeError, ValueError):
+                return False
+        if not isinstance(meta, dict):
+            return False
+
+        sudo_actual_user = meta.get("sudo_actual_user")
+        if not isinstance(sudo_actual_user, dict):
+            return False
+
+        return sudo_actual_user.get("id") in self._disabledEventLogScriptIds
 
     def _mainLoop(self):
         """
@@ -590,6 +750,7 @@ class Engine(object):
                 for collection in self._pluginCollections:
                     collection.process(event)
             self._saveEventIdData()
+            self._checkPluginBacklogs()
 
             # if we're lagging behind Shotgun, we received a full batch of events
             # skip the sleep() call in this case
@@ -606,12 +767,47 @@ class Engine(object):
         self.log.debug("Shuting down event processing loop.")
 
     def stop(self):
+        if not self._continue:
+            # Already stopped, or a stop is already underway. daemonizer.Daemon
+            # calls _cleanup() (which calls this) from two independent places:
+            # the SIGTERM/SIGINT handler (termHandler, guarded against a
+            # second signal re-entering it) and an unconditional
+            # atexit.register(self._delpid) that always fires again once the
+            # process is actually exiting - including after a signal-triggered
+            # stop already ran this method to completion. That second call
+            # used to be a harmless no-op (Plugin.shutdown() already checks
+            # its worker thread is alive before doing anything), but
+            # PluginCollection.shutdown() unconditionally building a fresh
+            # ThreadPoolExecutor is not: by the time atexit callbacks run,
+            # concurrent.futures.thread's own shutdown machinery may already
+            # be tearing down, and submitting to a brand new executor at that
+            # point raises "cannot schedule new futures after interpreter
+            # shutdown" instead of quietly doing nothing. Bail out here
+            # before doing any of that a second time.
+            return
+
         self._continue = False
         for collection in self._pluginCollections:
             collection.shutdown()
+
         if self.db_logger is not None:
             self.db_logger.shutdown()
             self.db_logger = None
+
+        # collection.shutdown() blocks until every plugin's queue is fully
+        # drained (see PluginCollection.shutdown()/Plugin.shutdown()), so
+        # by this point every plugin's _lastEventId reflects everything it
+        # actually finished processing - including whatever ran after the
+        # last periodic save inside _mainLoop() (that one only runs once
+        # per fetch iteration, not on every event a worker thread
+        # completes). Without this final save, any event processed in that
+        # gap between the last periodic save and shutdown was never
+        # persisted: on restart the checkpoint on disk still points before
+        # it, so it gets re-fetched and reprocessed - this is exactly how
+        # a restart mid-flight (e.g. the autopull/SIGHUP reload cycle)
+        # produced duplicate processing of the same event across two
+        # process instances.
+        self._saveEventIdData()
 
     def _getNewEvents(self):
         """
@@ -629,6 +825,37 @@ class Engine(object):
 
         if nextEventId is not None:
             filters = [["id", "greater_than", nextEventId - 1]]
+
+            # Narrow the query to only the event types some callback
+            # actually registered for. PluginCollection.process() still
+            # hands every fetched event to every active plugin regardless
+            # of its own callbacks' event types (unchanged below) - this
+            # only stops fetching+dispatching types no plugin anywhere
+            # cares about in the first place (e.g. Shotgun_PublishedFile_Change,
+            # Shotgun_Attachment_View - ~36% of one measured day's total
+            # volume, with zero registered listeners). registeredEventTypes
+            # is None if any callback matches everything, in which case
+            # this can't safely exclude anything.
+            registeredEventTypes = self._getRegisteredEventTypes()
+            if registeredEventTypes is not None:
+                filters.append(
+                    ["event_type", "in", sorted(registeredEventTypes)])
+
+            # Also exclude direct (non-sudo) writes from any Script with
+            # generate_event_log_entries disabled (see
+            # _loadDisabledEventLogScriptIds) - confirmed live that
+            # "not_in" is a valid operator against EventLogEntry.user.
+            # This does NOT catch a sudo_as_login write from one of
+            # these scripts (event["user"] there is the sudo'd human,
+            # not the script) - that case is only catchable after the
+            # fetch, via isSuppressedSudoEvent().
+            if self._disabledEventLogScriptIds:
+                filters.append([
+                    "user", "not_in",
+                    [{"type": "ApiUser", "id": scriptId}
+                     for scriptId in sorted(self._disabledEventLogScriptIds)],
+                ])
+
             fields = [
                 "id",
                 "event_type",
@@ -643,7 +870,16 @@ class Engine(object):
             order = [{"column": "id", "direction": "asc"}]
 
             conn_attempts = 0
-            while True:
+            # Was `while True:`, which never looked at self._continue - a
+            # SIGTERM/SIGINT during a connection outage sets that flag, but
+            # this loop kept retrying forever regardless, so stop()/the
+            # supervisor's own stop attempt would hang until the outage
+            # resolved on its own (measured over 2 hours in practice).
+            # supervisor.py now waits indefinitely (not just a fixed
+            # timeout) for a clean stop before launching a replacement,
+            # so a stuck outage here would otherwise block every future
+            # reload, not just this one.
+            while self._continue:
                 try:
                     events = self._sg.find(
                         "EventLogEntry",
@@ -714,6 +950,56 @@ class Engine(object):
             else:
                 self.log.warning("No state was found. Not saving to disk.")
 
+    def _checkPluginBacklogs(self):
+        """
+        Alert on Slack when a plugin's own queue falls critically behind
+        the engine's dispatch cursor (see Plugin.getPendingCount()).
+
+        Uses two thresholds (hysteresis) instead of one: a count that
+        settles anywhere between them changes nothing, so a value
+        oscillating right at a single cutoff can't spam repeated
+        alerts. Only the alert-threshold crossing (not-alerting ->
+        alerting) and the clear-threshold crossing (alerting -> not)
+        actually send anything - being critical for many consecutive
+        passes only sends the one alert from the first crossing.
+
+        Cheap to run every pass: getPendingCount() is in-memory cursor
+        arithmetic, no queue or SG access.
+        """
+        alertThreshold = self.config.getPluginBacklogAlertThreshold()
+        clearThreshold = self.config.getPluginBacklogClearThreshold()
+
+        for collection in self._pluginCollections:
+            for plugin in collection:
+                pending = plugin.getPendingCount()
+
+                if not plugin._backlogAlertActive and pending >= alertThreshold:
+                    plugin._backlogAlertActive = True
+                    message = (
+                        "Boxel: plugin backlog critical\n"
+                        "plugin={0}\n"
+                        "pending_events={1}\n"
+                        "alert_threshold={2}"
+                    ).format(plugin.getName(), pending, alertThreshold)
+                    threading.Thread(
+                        target=slack_msj.send_slack_message,
+                        args=(message,),
+                        daemon=True,
+                    ).start()
+                elif plugin._backlogAlertActive and pending <= clearThreshold:
+                    plugin._backlogAlertActive = False
+                    message = (
+                        "Boxel: plugin backlog recovered\n"
+                        "plugin={0}\n"
+                        "pending_events={1}\n"
+                        "clear_threshold={2}"
+                    ).format(plugin.getName(), pending, clearThreshold)
+                    threading.Thread(
+                        target=slack_msj.send_slack_message,
+                        args=(message,),
+                        daemon=True,
+                    ).start()
+
     def _checkConnectionAttempts(self, conn_attempts, msg):
         conn_attempts += 1
         if conn_attempts == self._max_conn_retries:
@@ -724,7 +1010,7 @@ class Engine(object):
                 msg,
             )
             conn_attempts = 0
-            time.sleep(self._conn_retry_sleep)
+            self._interruptibleSleep(self._conn_retry_sleep)
         else:
             self.log.warning(
                 "Unable to connect to SG (attempt %s of %s): %s",
@@ -733,6 +1019,18 @@ class Engine(object):
                 msg,
             )
         return conn_attempts
+
+    def _interruptibleSleep(self, seconds):
+        """
+        Sleep for up to `seconds`, but check self._continue at least once a
+        second instead of blocking for the whole duration - a stop()
+        request during the connection-retry backoff (self._conn_retry_sleep,
+        default 60s) should take effect within about a second, not have to
+        wait out the rest of that sleep.
+        """
+        deadline = time.time() + seconds
+        while self._continue and time.time() < deadline:
+            time.sleep(min(1, deadline - time.time()))
 
 
 class PluginCollection(object):
@@ -777,6 +1075,22 @@ class PluginCollection(object):
                 eId = newId
         return eId
 
+    def getMatchedEventTypes(self):
+        """
+        Union of event_type strings every active plugin in this
+        collection cares about, or None if any of them matches every
+        event type. See Engine._getRegisteredEventTypes().
+        """
+        event_types = set()
+        for plugin in self:
+            if not plugin.isActive():
+                continue
+            matched = plugin.getMatchedEventTypes()
+            if matched is None:
+                return None
+            event_types.update(matched)
+        return event_types
+
     def process(self, event):
         """
         Hand C{event} off to every active plugin in this collection.
@@ -804,9 +1118,20 @@ class PluginCollection(object):
         Stop every plugin's worker thread, waiting for any event currently
         being processed to finish. Should be called when the engine is
         shutting down.
+
+        Each plugin's shutdown() only touches its own queue/worker thread,
+        so they're all run concurrently here instead of one at a time -
+        draining them one after another would make total shutdown time the
+        sum of every plugin's drain time instead of just the slowest one,
+        which matters directly for supervisor.py's stop timeout.
         """
-        for plugin in self:
-            plugin.shutdown()
+        plugins = list(self)
+        if not plugins:
+            return
+        with ThreadPoolExecutor(
+            max_workers=len(plugins), thread_name_prefix="PluginShutdown"
+        ) as executor:
+            list(executor.map(lambda plugin: plugin.shutdown(), plugins))
 
     def load(self):
         """
@@ -817,6 +1142,15 @@ class PluginCollection(object):
         - Find all valid .py plugin files.
         - Loop on all plugin files.
         - For any new plugins, load them, otherwise, refresh them.
+
+        Each plugin's actual load() (file read + running its own
+        registerCallbacks(), which sets up its own SG connection) is
+        independent of every other plugin's - none of them share
+        mutable state - so they're all run concurrently here instead of
+        one at a time. This is what was making every single startup and
+        every reload pass (whenever a modified file is picked up) take
+        roughly (plugin count * per-plugin load time) instead of about
+        as long as the single slowest plugin.
         """
         newPlugins = {}
 
@@ -831,7 +1165,29 @@ class PluginCollection(object):
                     self._engine, os.path.join(self.path, basename)
                 )
 
-            newPlugins[basename].load()
+        if newPlugins:
+            with ThreadPoolExecutor(
+                max_workers=len(newPlugins), thread_name_prefix="PluginLoad"
+            ) as executor:
+                futures = {
+                    executor.submit(plugin.load): basename
+                    for basename, plugin in newPlugins.items()
+                }
+                for future in as_completed(futures):
+                    basename = futures[future]
+                    try:
+                        future.result()
+                    except Exception:
+                        # Plugin.load() already catches and logs its own
+                        # errors (deactivating itself on failure). This
+                        # is only a last-resort net so one plugin's
+                        # truly unexpected exception can't take down
+                        # this loading pass or any other plugin's load.
+                        self._engine.log.critical(
+                            "Unhandled exception loading plugin %s.\n\n%s",
+                            basename,
+                            traceback.format_exc(),
+                        )
 
         # Any plugin that disappeared from disk is no longer referenced and
         # won't get new events, but its worker thread is still sitting there
@@ -907,6 +1263,11 @@ class Plugin(object):
         # plugin hasn't gotten to yet, processing them twice.
         self._lastDispatchedEventId = None
 
+        # Whether this plugin currently has an active "critically behind"
+        # Slack alert outstanding - see Engine._checkPluginBacklogs(). Only
+        # read/written from the main thread, so it needs no lock of its own.
+        self._backlogAlertActive = False
+
         # Setup the plugin's logger
         self.logger = logging.getLogger("plugin." + self.getName())
         self.logger.config = self._engine.config
@@ -917,8 +1278,12 @@ class Plugin(object):
                 self.logger, self._engine.config.getLogFile("plugin." + self.getName())
             )
 
+        self._db_event_log = False
+        self._last_run_invoked = False
+        self._last_run_had_error = False
+
         # Capture this plugin's log output (and callback child loggers) for
-        # the database log. File handlers already attached above are unchanged.
+        # the database event log. File handlers already attached above are unchanged.
         self._db_output_handler = None
         if self._engine.db_logger is not None:
             self._db_output_handler = self._engine.db_logger.attach_capture(self.logger)
@@ -929,19 +1294,28 @@ class Plugin(object):
     def setState(self, state):
         with self._lock:
             if isinstance(state, int):
-                self._lastEventId = state
+                newLastEventId, newBacklog = state, self._backlog
             elif isinstance(state, tuple):
-                self._lastEventId, self._backlog = state
+                newLastEventId, newBacklog = state
             else:
                 raise ValueError("Unknown state type: %s." % type(state))
 
-            # Only seed the dispatch cursor the first time state is set (i.e.
-            # at startup, before anything has been dispatched this run).
-            # Later calls - e.g. Engine._loadEventIdData() re-applying
-            # whatever was last saved to disk - must not be allowed to drag
-            # it backwards, or we'd start re-queuing events this plugin is
-            # already working through.
+            # Only apply the loaded state the first time (i.e. at startup,
+            # before anything has been dispatched this run). Engine._mainLoop
+            # calls Engine._loadEventIdData() again on every pass, re-applying
+            # whatever was last written by _saveEventIdData() - which is a
+            # snapshot from before this plugin's worker thread may have kept
+            # processing its queue in the meantime (it runs independently, on
+            # its own thread). Applying that stale snapshot unconditionally
+            # would roll _lastEventId/_backlog backwards, resurrecting a
+            # backlog id the worker thread already resolved and removed - the
+            # engine would then re-fetch and re-queue it, and this plugin
+            # would process it a second time. Once dispatching has started
+            # this run, this plugin's own in-memory state is already the
+            # source of truth and must not be overwritten by disk.
             if self._lastDispatchedEventId is None:
+                self._lastEventId = newLastEventId
+                self._backlog = newBacklog
                 self._lastDispatchedEventId = self._lastEventId
 
     def getState(self):
@@ -951,6 +1325,45 @@ class Plugin(object):
             # we've released the lock, while this plugin's worker thread may
             # still be concurrently mutating the real dict.
             return (self._lastEventId, dict(self._backlog))
+
+    def getPendingCount(self):
+        """
+        Number of events dispatched to this plugin's queue but not yet
+        actually processed - how far its worker thread is behind the
+        engine's own dispatch cursor. Free to compute (in-memory
+        arithmetic on cursors already tracked, no queue/SG access), so
+        it's safe to check every pass through the main loop.
+        """
+        with self._lock:
+            if self._lastDispatchedEventId is None or self._lastEventId is None:
+                return 0
+            return max(0, self._lastDispatchedEventId - self._lastEventId)
+
+    def getMatchedEventTypes(self):
+        """
+        Union of event_type strings every active callback registered by
+        this plugin cares about, or None if any of them (or the plugin
+        having no callbacks at all, which historically meant "run on
+        everything until it registers some") matches every event type.
+
+        See Callback.getMatchedEventTypes() and
+        Engine._getRegisteredEventTypes().
+        """
+        with self._lock:
+            callbacks = list(self._callbacks)
+
+        if not callbacks:
+            return None
+
+        event_types = set()
+        for callback in callbacks:
+            if not callback.isActive():
+                continue
+            matched = callback.getMatchedEventTypes()
+            if matched is None:
+                return None
+            event_types.update(matched)
+        return event_types
 
     def getNextUnprocessedEventId(self):
         """
@@ -1056,6 +1469,20 @@ class Plugin(object):
         """
         self._engine.setEmailsOnLogger(self.logger, emails)
 
+    def enableDatabaseEventLog(self, enabled=True):
+        """
+        Record this plugin's per-event output in the database event log.
+
+        Errors are always stored, for every plugin. Call this from
+        C{registerCallbacks} to also store successful runs and their logger
+        output. Default is off.
+
+        @param enabled: True to persist per-event output, False to keep only
+            errors (and per-minute stats).
+        @type enabled: I{bool}
+        """
+        self._db_event_log = bool(enabled)
+
     def load(self):
         """
         Load/Reload the plugin and all its callbacks.
@@ -1093,6 +1520,7 @@ class Plugin(object):
             self._mtime = mtime
             self._callbacks = []
             self._active = True
+            self._db_event_log = False
 
             try:
                 plugin = importlib_wrapper.load_source(self._pluginName, self._path)
@@ -1156,11 +1584,17 @@ class Plugin(object):
     def process(self, event):
         db_logger_obj = self._engine.db_logger
         started_at = None
+        self._last_run_invoked = False
+        self._last_run_had_error = False
         if db_logger_obj is not None:
             started_at = datetime.datetime.now(datetime.timezone.utc).replace(
                 tzinfo=None
             )
             if self._db_output_handler is not None:
+                if self._db_event_log:
+                    self._db_output_handler.setLevel(logging.NOTSET)
+                else:
+                    self._db_output_handler.setLevel(logging.ERROR)
                 self._db_output_handler.begin()
 
         try:
@@ -1179,16 +1613,19 @@ class Plugin(object):
 
                 return self._active
         finally:
-            if db_logger_obj is not None:
+            output = None
+            if self._db_output_handler is not None:
+                output = self._db_output_handler.finish()
+            if db_logger_obj is not None and (
+                self._last_run_invoked or self._last_run_had_error
+            ):
                 completed_at = datetime.datetime.now(datetime.timezone.utc).replace(
                     tzinfo=None
                 )
                 duration_us = int(
                     (completed_at - started_at).total_seconds() * 1_000_000
                 )
-                output = None
-                if self._db_output_handler is not None:
-                    output = self._db_output_handler.finish()
+                had_error = self._last_run_had_error
                 db_logger_obj.log_plugin_run(
                     event["id"],
                     self.getName(),
@@ -1196,57 +1633,104 @@ class Plugin(object):
                     duration_us,
                     completed_at,
                     output,
+                    had_error=had_error,
+                    event_log=self._db_event_log or had_error,
                 )
 
     def _process(self, event):
         with self._lock:
+            if self._engine.isSuppressedSudoEvent(event):
+                # A sudo_as_login write from a Script with
+                # generate_event_log_entries disabled (see
+                # Engine.isSuppressedSudoEvent) - skip every callback's
+                # own work entirely, but still return self._active so
+                # process() calls _updateLastEventId(event) exactly as
+                # it would for any other event none of this plugin's
+                # callbacks matched. That keeps this plugin's cursor/
+                # backlog bookkeeping advancing normally instead of
+                # treating a whole burst of these as a gap to retry.
+                # self._last_run_invoked/_last_run_had_error stay at the
+                # False the caller (process(), above) just reset them
+                # to, so the database logger correctly records nothing
+                # for a suppressed event either.
+                msg = "Skipping event %d - suppressed sudo_as_login event."
+                self.logger.debug(msg, event["id"])
+                return self._active
+
+            invoked = False
+            had_error = False
             for callback in self:
                 if callback.isActive():
                     if callback.canProcess(event):
+                        invoked = True
                         msg = "Dispatching event %d to callback %s."
                         self.logger.debug(msg, event["id"], str(callback))
                         if not callback.process(event):
                             # A callback in the plugin failed. Deactivate the whole
                             # plugin.
+                            had_error = had_error or callback._had_error
                             self._active = False
                             break
+                        had_error = had_error or callback._had_error
                 else:
                     msg = "Skipping inactive callback %s in plugin."
                     self.logger.debug(msg, str(callback))
 
+            self._last_run_invoked = invoked
+            self._last_run_had_error = had_error
             return self._active
 
     def _updateLastEventId(self, event):
         BACKLOG_TIMEOUT = (
-            5  # time in minutes after which we consider a pending event won't happen
+            5  # minutes to keep retrying a gap before giving up on it
         )
+
+        # Engine._getRegisteredEventTypes() now excludes event types no
+        # plugin anywhere registered for directly in the SG query, so a
+        # gap this size or larger is overwhelmingly one of those excluded
+        # types (tens of thousands/day on a busy site) rather than the
+        # handful-of-ids visibility-ordering hiccup this backlog exists
+        # for - those ids will never come back no matter how long we
+        # wait, since every future fetch excludes them the same way.
+        # Backlogging them anyway would just grow _backlog without bound
+        # for zero benefit. Only gaps at or under this size still get the
+        # retry treatment below.
+        MAX_BACKLOG_GAP = 50
+
         if self._lastEventId is not None and event["id"] > self._lastEventId + 1:
-            event_date = event["created_at"].replace(tzinfo=None)
-            if datetime.datetime.now() > (
-                event_date + datetime.timedelta(minutes=BACKLOG_TIMEOUT)
-            ):
-                # the event we've just processed happened more than BACKLOG_TIMEOUT minutes ago so any event
-                # with a lower id should have shown up in the EventLog by now if it actually happened
-                if event["id"] == self._lastEventId + 2:
-                    self.logger.info(
-                        "Event %d never happened - ignoring.", self._lastEventId + 1
-                    )
-                else:
-                    self.logger.info(
-                        "Events %d-%d never happened - ignoring.",
-                        self._lastEventId + 1,
-                        event["id"] - 1,
-                    )
-            else:
-                # in this case, we want to add the missing events to the backlog as they could show up in the
-                # EventLog within BACKLOG_TIMEOUT minutes, during which we'll keep asking for the same range
-                # them to show up until they expire
+            gap_size = event["id"] - self._lastEventId - 1
+            if gap_size <= MAX_BACKLOG_GAP:
+                # Always give a newly-discovered gap a real chance to resolve,
+                # timed from right now - not from how old `event` (created_at)
+                # already is. The previous logic gave up immediately whenever
+                # the event that revealed the gap was itself already more than
+                # BACKLOG_TIMEOUT minutes old, which conflates two different
+                # things: an id SG genuinely never produced (a rolled-back
+                # transaction, say) versus this daemon simply having been
+                # offline or badly backlogged before it got around to noticing
+                # the gap. In the second case every event already looks old
+                # by the time the daemon catches up, so real, still-pending
+                # events were being discarded outright instead of retried -
+                # exactly the scenario we've now measured happening for over
+                # two hours at a stretch. Adding the gap to the backlog
+                # unconditionally instead lets getNextUnprocessedEventId()'s
+                # own expiry (also timed from here, unchanged) make that call
+                # after BACKLOG_TIMEOUT real minutes of actually trying,
+                # regardless of how long the daemon was down beforehand.
                 expiration = datetime.datetime.now() + datetime.timedelta(
                     minutes=BACKLOG_TIMEOUT
                 )
                 for skippedId in range(self._lastEventId + 1, event["id"]):
                     self.logger.info("Adding event id %d to backlog.", skippedId)
                     self._backlog[skippedId] = expiration
+            else:
+                self.logger.debug(
+                    "Skipping %d-id gap before event %d - too large to be "
+                    "a visibility-ordering hiccup, almost certainly "
+                    "excluded event types (see "
+                    "Engine._getRegisteredEventTypes()).",
+                    gap_size, event["id"],
+                )
         self._lastEventId = event["id"]
 
     def __iter__(self):
@@ -1275,7 +1759,12 @@ class Registrar(object):
         Wrap a plugin so it can be passed to a user.
         """
         self._plugin = plugin
-        self._allowed = ["logger", "setEmails", "registerCallback"]
+        self._allowed = [
+            "logger",
+            "setEmails",
+            "registerCallback",
+            "enableDatabaseEventLog",
+        ]
 
     def getLogger(self):
         """
@@ -1340,6 +1829,7 @@ class Callback(object):
         self._args = args
         self._stopOnError = stopOnError
         self._active = True
+        self._had_error = False
 
         # Find a name for this object
         if hasattr(callback, "__name__"):
@@ -1376,6 +1866,21 @@ class Callback(object):
 
         return False
 
+    def getMatchedEventTypes(self):
+        """
+        The set of event_type strings this callback matches, or None if
+        it matches every event type (a falsy matchEvents, or one
+        containing the "*" wildcard key - mirrors the two "match
+        everything" branches at the top of canProcess()).
+
+        Used by Engine._getRegisteredEventTypes() to narrow the
+        EventLogEntry query in _getNewEvents() to only the event types
+        some callback actually cares about.
+        """
+        if not self._matchEvents or "*" in self._matchEvents:
+            return None
+        return set(self._matchEvents.keys())
+
     def process(self, event):
         """
         Process an event with the callback object supplied on initialization.
@@ -1389,6 +1894,8 @@ class Callback(object):
         # set session_uuid for UI updates
         if self._engine._use_session_uuid:
             self._shotgun.set_session_uuid(event["session_uuid"])
+
+        self._had_error = False
 
         if self._engine.timing_logger:
             start_time = datetime.datetime.now(SG_TIMEZONE.local)
@@ -1431,6 +1938,7 @@ class Callback(object):
             ]
             self._engine.timing_logger.info(msg_format, *data)
 
+        self._had_error = error
         return self._active
 
     def _prettyTimeDeltaFormat(self, time_delta):

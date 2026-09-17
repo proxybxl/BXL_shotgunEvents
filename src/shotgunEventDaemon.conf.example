@@ -63,18 +63,22 @@ max_event_batch_size = 500
 
 
 [database_log]
-# Log each plugin worker-thread execution to MariaDB, in addition to the file
-# logging configured above (file logging is not replaced or migrated).
-# One row is written per (event_id, plugin) run with start time, duration,
-# completion time, and captured plugin logger output.
+# MariaDB logging in addition to file logging (file logging is not replaced).
 #
-# Create the tables first:
+# Per-minute stats for every plugin that actually invokes a callback:
+#   plugin_run_stats  (run count, error count, min/avg/max duration)
+#
+# Per-event rows are written only when a callback errors, or when a plugin
+# opts in from registerCallbacks:
+#   reg.enableDatabaseEventLog()
+# See src/examplePlugins/logArgs.py.
+#
+# Create / update tables:
 #   mysql -u root -p < sql/plugin_event_log.sql
+# Existing installs must recreate the MEMORY buffer:
+#   mysql -u root -p shotgun_events < sql/plugin_event_log_recreate_mem.sql
 #
-# Writes go to a MEMORY buffer table (plugin_event_log_mem) so hundreds of
-# inserts per second do not wait on disk. Every 15 minutes (and on shutdown)
-# the daemon copies complete rows -- including full plugin output -- to the
-# InnoDB archive table (plugin_event_log) and truncates the buffer.
+# Compact samples go to plugin_event_log_mem and are aggregated once a minute.
 enabled: False
 
 host: localhost
@@ -83,11 +87,15 @@ database: shotgun_events
 user: shotgun_events
 password: change_me
 
-# Seconds between MEMORY -> InnoDB flushes. 900 = 15 minutes.
-# flush_interval_seconds: 900
+# Seconds between MEMORY -> plugin_run_stats aggregates. 60 = one minute.
+# flush_interval_seconds: 60
 
-# Rows batched into each INSERT against the MEMORY table.
-# batch_size: 100
+# Emergency aggregate if the MEMORY buffer reaches this many samples before
+# the interval elapses. Default 250000. At ~2000 runs/sec that is ~2 minutes.
+# flush_row_threshold: 250000
+
+# Rows pulled off the in-process queue per INSERT into the MEMORY buffer.
+# batch_size: 1000
 
 # Max queued plugin runs waiting to be written. Extra runs are dropped.
 # queue_maxsize: 50000

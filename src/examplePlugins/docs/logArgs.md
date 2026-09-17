@@ -9,3 +9,10 @@ dictionary.
 ## Args
 
 No settings.
+
+To also store this plugin's per-event logger output in MariaDB (not only
+errors and per-minute stats), uncomment in `registerCallbacks`:
+
+```
+reg.enableDatabaseEventLog()
+```
