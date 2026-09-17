@@ -14,6 +14,7 @@ import datetime
 import logging
 import queue
 import threading
+import time
 import traceback
 
 # MySQL/MariaDB ER_RECORD_FILE_FULL: MEMORY table exceeded max_heap_table_size.
@@ -203,21 +204,17 @@ class DatabaseLogger(object):
         self._mem_rows = 0
         self._window_started_at = None
         self._writer_thread = None
-        self._flush_thread = None
 
     def start(self):
-        """Open the DB connection and start writer/flusher threads."""
-        self._conn = self._open_connection()
+        """Start the writer thread. The MySQL connection is opened on that thread."""
+        if self._writer_thread is not None and self._writer_thread.is_alive():
+            return
+        self._stop.clear()
         self._window_started_at = _period_start()
         self._writer_thread = threading.Thread(
             target=self._writer_loop, name="DatabaseLogger-writer", daemon=True
         )
         self._writer_thread.start()
-        if self._flush_in_daemon:
-            self._flush_thread = threading.Thread(
-                target=self._flush_loop, name="DatabaseLogger-flush", daemon=True
-            )
-            self._flush_thread.start()
         self._logger.info(
             "Database logging started (host=%s db=%s flush_interval=%ss).",
             self._host,
@@ -294,7 +291,7 @@ class DatabaseLogger(object):
             )
 
     def shutdown(self):
-        """Stop threads, drain the queue, aggregate remaining samples."""
+        """Stop the writer thread, which drains the queue and flushes stats."""
         self._stop.set()
         try:
             self._queue.put_nowait(self._wakeup)
@@ -302,19 +299,6 @@ class DatabaseLogger(object):
             pass
         if self._writer_thread is not None:
             self._writer_thread.join(timeout=30)
-        if self._flush_thread is not None:
-            self._flush_thread.join(timeout=30)
-        try:
-            self._drain_queue()
-            if self._flush_in_daemon:
-                self.flush_to_disk()
-        except Exception:
-            self._logger.error(
-                "Error while shutting down database logging.\n\n%s",
-                traceback.format_exc(),
-            )
-        finally:
-            self._close_connection()
         if self._dropped:
             self._logger.warning(
                 "Database logging dropped %d plugin run(s) because the queue was full.",
@@ -328,16 +312,19 @@ class DatabaseLogger(object):
         """
         with self._db_lock:
             period_start = self._window_started_at or _period_start()
+            sample_count = self._mem_rows
             try:
                 self._execute(_AGGREGATE_MEM_SQL, (period_start,))
                 self._truncate_memory()
                 self._mem_rows = 0
                 self._window_started_at = _period_start()
-                self._logger.debug(
-                    "Aggregated plugin_event_log_mem into plugin_run_stats "
-                    "for period %s.",
-                    period_start,
-                )
+                if sample_count:
+                    self._logger.info(
+                        "Aggregated %d plugin run sample(s) into "
+                        "plugin_run_stats for %s.",
+                        sample_count,
+                        period_start,
+                    )
             except Exception:
                 self._logger.error(
                     "Failed to aggregate plugin event log to plugin_run_stats.\n\n%s",
@@ -382,24 +369,65 @@ class DatabaseLogger(object):
         return self._conn
 
     def _writer_loop(self):
+        # MySQLdb connections are not thread-safe and do not survive fork().
+        # Open the connection on this thread and do all SQL here.
+        try:
+            self._conn = self._open_connection()
+        except Exception:
+            self._logger.error(
+                "Database logger writer could not connect to MariaDB.\n\n%s",
+                traceback.format_exc(),
+            )
+            return
+        self._logger.info("Database logger writer connected.")
+        next_flush = time.monotonic() + self._flush_interval
         while not self._stop.is_set():
-            batch = self._collect_batch(timeout=1.0)
-            if batch:
-                self._write_batch(batch)
-        batch = self._collect_batch(timeout=0)
-        if batch:
-            self._write_batch(batch)
-
-    def _flush_loop(self):
-        while not self._stop.wait(self._flush_interval):
             try:
-                self._drain_queue()
-                self.flush_to_disk()
+                remaining = next_flush - time.monotonic()
+                if self._flush_in_daemon and remaining <= 0:
+                    self.flush_to_disk()
+                    next_flush = time.monotonic() + self._flush_interval
+                    continue
+                timeout = 1.0
+                if self._flush_in_daemon:
+                    timeout = min(1.0, max(0.05, remaining))
+                batch = self._collect_batch(timeout=timeout)
+                if batch:
+                    self._write_batch(batch)
+                    if (
+                        self._flush_in_daemon
+                        and self._mem_rows >= self._flush_row_threshold
+                    ):
+                        self.flush_to_disk()
+                        next_flush = time.monotonic() + self._flush_interval
             except Exception:
                 self._logger.error(
-                    "Periodic database log flush failed.\n\n%s",
+                    "Database logger writer error; continuing.\n\n%s",
                     traceback.format_exc(),
                 )
+                try:
+                    self._reconnect()
+                except Exception:
+                    pass
+        batch = self._collect_batch(timeout=0)
+        if batch:
+            try:
+                self._write_batch(batch)
+            except Exception:
+                self._logger.error(
+                    "Database logger writer error while stopping.\n\n%s",
+                    traceback.format_exc(),
+                )
+        try:
+            if self._flush_in_daemon:
+                self.flush_to_disk()
+        except Exception:
+            self._logger.error(
+                "Database logger flush failed while stopping.\n\n%s",
+                traceback.format_exc(),
+            )
+        finally:
+            self._close_connection()
 
     def _collect_batch(self, timeout):
         batch = []
@@ -438,8 +466,6 @@ class DatabaseLogger(object):
                     self._mem_rows += len(stats)
                 if events:
                     self._executemany(_INSERT_EVENT_SQL, events, chunk_size=100)
-            if self._flush_in_daemon and self._mem_rows >= self._flush_row_threshold:
-                self.flush_to_disk()
         except Exception as err:
             if _is_table_full(err) and self._flush_in_daemon:
                 self._recover_table_full(stats, events)
