@@ -69,3 +69,28 @@ ALTER TABLE plugin_event_log
 
 ALTER TABLE plugin_event_log
     ADD COLUMN IF NOT EXISTS log_reason VARCHAR(16) NOT NULL DEFAULT 'plugin' AFTER had_error;
+
+CREATE TABLE IF NOT EXISTS plugin_event_queue (
+    id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    plugin_name     VARCHAR(255) NOT NULL,
+    event_id        BIGINT NOT NULL,
+    event_type      VARCHAR(255) NULL,
+    attribute_name  VARCHAR(255) NULL,
+    entity_type     VARCHAR(64) NULL,
+    entity_id       BIGINT NULL,
+    entity_name     VARCHAR(255) NULL,
+    project_id      BIGINT NULL,
+    project_name    VARCHAR(255) NULL,
+    status          ENUM('processing', 'pending') NOT NULL,
+    pending_count   INT UNSIGNED NOT NULL DEFAULT 0,
+    queued_at       DATETIME(6) NOT NULL,
+    started_at      DATETIME(6) NULL,
+    reported_at     DATETIME(6) NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_plugin_event (plugin_name, event_id),
+    INDEX idx_status (status),
+    INDEX idx_plugin_status (plugin_name, status),
+    INDEX idx_reported_at (reported_at)
+) ENGINE=InnoDB
+  DEFAULT CHARSET=utf8mb4
+  COLLATE=utf8mb4_unicode_ci;

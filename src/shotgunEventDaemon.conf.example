@@ -73,10 +73,15 @@ max_event_batch_size = 500
 #   reg.enableDatabaseEventLog()
 # See src/examplePlugins/logArgs.py.
 #
+# plugin_event_queue is a live snapshot of each plugin's current event and
+# the events still waiting on its worker. The dashboard Queue view reads it.
+#
 # Create / update tables:
 #   mysql -u root -p < sql/plugin_event_log.sql
 # Existing installs must recreate the MEMORY buffer:
 #   mysql -u root -p shotgun_events < sql/plugin_event_log_recreate_mem.sql
+# Existing installs that only need the queue table:
+#   mysql -u root -p shotgun_events < sql/plugin_event_queue.sql
 #
 # Compact samples go to plugin_event_log_mem and are aggregated once a minute.
 enabled: False

@@ -4,11 +4,16 @@
 -- plugin_event_log_mem   MEMORY buffer of compact per-run samples (no output)
 -- plugin_run_stats       InnoDB per-plugin per-minute aggregates
 -- plugin_event_log       InnoDB event log: errors, plus plugins that opt in
+-- plugin_event_queue     InnoDB live snapshot of processing + pending events
 --
 -- Every run that actually invokes a callback is inserted into the MEMORY
 -- table (plugin name, duration, error flag only). Once a minute the daemon
 -- aggregates that buffer into plugin_run_stats (run count, error count,
 -- min/avg/max duration) and truncates the buffer.
+--
+-- plugin_event_queue is replaced as plugins enqueue, start, and finish
+-- events. It is not a history: a row exists only while that event is
+-- currently processing or still waiting on that plugin's worker.
 --
 -- plugin_event_log is NOT a full trace. A row is written only when a
 -- callback raises, or when the plugin calls reg.enableDatabaseEventLog().
@@ -25,6 +30,8 @@
 --   GRANT SELECT, INSERT, UPDATE ON shotgun_events.plugin_run_stats
 --     TO 'shotgun_events'@'localhost';
 --   GRANT SELECT, INSERT ON shotgun_events.plugin_event_log
+--     TO 'shotgun_events'@'localhost';
+--   GRANT SELECT, INSERT, DELETE ON shotgun_events.plugin_event_queue
 --     TO 'shotgun_events'@'localhost';
 --   FLUSH PRIVILEGES;
 --
@@ -98,6 +105,36 @@ CREATE TABLE IF NOT EXISTS plugin_event_log (
     INDEX idx_started_at (started_at),
     INDEX idx_had_error (had_error),
     INDEX idx_plugin_started (plugin_name, started_at)
+) ENGINE=InnoDB
+  DEFAULT CHARSET=utf8mb4
+  COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- Live per-plugin work queue. Replaced by the daemon; not a history table.
+-- pending_count is the plugin's full pending depth even if only the first
+-- N pending events are stored (see DatabaseLogger).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS plugin_event_queue (
+    id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    plugin_name     VARCHAR(255) NOT NULL,
+    event_id        BIGINT NOT NULL,
+    event_type      VARCHAR(255) NULL,
+    attribute_name  VARCHAR(255) NULL,
+    entity_type     VARCHAR(64) NULL,
+    entity_id       BIGINT NULL,
+    entity_name     VARCHAR(255) NULL,
+    project_id      BIGINT NULL,
+    project_name    VARCHAR(255) NULL,
+    status          ENUM('processing', 'pending') NOT NULL,
+    pending_count   INT UNSIGNED NOT NULL DEFAULT 0,
+    queued_at       DATETIME(6) NOT NULL,
+    started_at      DATETIME(6) NULL,
+    reported_at     DATETIME(6) NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_plugin_event (plugin_name, event_id),
+    INDEX idx_status (status),
+    INDEX idx_plugin_status (plugin_name, status),
+    INDEX idx_reported_at (reported_at)
 ) ENGINE=InnoDB
   DEFAULT CHARSET=utf8mb4
   COLLATE=utf8mb4_unicode_ci;
