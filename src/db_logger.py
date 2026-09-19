@@ -8,6 +8,10 @@ and the buffer is truncated.
 
 A row is written to plugin_event_log only when a callback errors, or when
 the plugin has called L{Plugin.enableDatabaseEventLog}.
+
+plugin_event_queue holds a live snapshot of each plugin's current event and
+the events still waiting on its worker. Plugins call L{update_plugin_queue};
+the writer thread replaces the table. It is not a history.
 """
 
 import datetime
@@ -34,6 +38,21 @@ _INSERT_EVENT_SQL = (
 )
 
 _TRUNCATE_MEM_SQL = "TRUNCATE TABLE plugin_event_log_mem"
+
+_DELETE_QUEUE_SQL = "DELETE FROM plugin_event_queue"
+
+_INSERT_QUEUE_SQL = (
+    "INSERT INTO plugin_event_queue ("
+    "plugin_name, event_id, event_type, attribute_name, "
+    "entity_type, entity_id, entity_name, "
+    "project_id, project_name, status, pending_count, "
+    "queued_at, started_at, reported_at"
+    ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+)
+
+# Re-write an unchanged snapshot at least this often so reported_at stays
+# fresh while a plugin is blocked on a long event.
+_QUEUE_HEARTBEAT_SECONDS = 2.0
 
 _AGGREGATE_MEM_SQL = (
     "INSERT INTO plugin_run_stats ("
@@ -130,13 +149,37 @@ def _period_start(dt=None):
     return dt.replace(second=0, microsecond=0)
 
 
+def queue_item_to_row(plugin_name, item, reported_at):
+    """Convert one plugin queue snapshot dict into an INSERT parameter tuple."""
+    return (
+        plugin_name,
+        int(item["event_id"]),
+        item.get("event_type"),
+        item.get("attribute_name"),
+        item.get("entity_type"),
+        item.get("entity_id"),
+        item.get("entity_name"),
+        item.get("project_id"),
+        item.get("project_name"),
+        item.get("status"),
+        int(item.get("pending_count") or 0),
+        _naive_utc(item.get("queued_at")),
+        _naive_utc(item.get("started_at")),
+        reported_at,
+    )
+
+
 class DatabaseLogger(object):
     """
-    Non-blocking logger for per-minute plugin stats and sparse event logs.
+    Non-blocking logger for per-minute plugin stats, sparse event logs,
+    and the live plugin work-queue snapshot.
 
     Plugin worker threads call L{log_plugin_run}, which only enqueues. A
     writer thread inserts compact samples into MEMORY and event rows into
     InnoDB. A flusher aggregates MEMORY into plugin_run_stats each minute.
+
+    L{update_plugin_queue} stores the latest in-memory snapshot per plugin;
+    the writer replaces plugin_event_queue from that snapshot.
 
     Database failures never propagate to callers.
     """
@@ -204,6 +247,10 @@ class DatabaseLogger(object):
         self._mem_rows = 0
         self._window_started_at = None
         self._writer_thread = None
+        self._queue_snapshot_lock = threading.Lock()
+        self._queue_by_plugin = {}
+        self._queue_snapshot_dirty = False
+        self._last_queue_write = 0.0
 
     def start(self):
         """Start the writer thread. The MySQL connection is opened on that thread."""
@@ -286,6 +333,27 @@ class DatabaseLogger(object):
             self._logger.error(
                 "Failed to enqueue plugin run for event %s plugin %s.\n\n%s",
                 event_id,
+                plugin_name,
+                traceback.format_exc(),
+            )
+
+    def update_plugin_queue(self, plugin_name, rows):
+        """
+        Replace this plugin's live queue snapshot. Never blocks for I/O.
+
+        @param plugin_name: Plugin basename (no .py).
+        @type plugin_name: I{str}
+        @param rows: Snapshot dicts from L{Plugin.getQueueSnapshot}. An
+            empty list means this plugin has nothing processing or pending.
+        @type rows: I{list} of I{dict}
+        """
+        try:
+            with self._queue_snapshot_lock:
+                self._queue_by_plugin[plugin_name] = list(rows)
+                self._queue_snapshot_dirty = True
+        except Exception:
+            self._logger.error(
+                "Failed to store queue snapshot for plugin %s.\n\n%s",
                 plugin_name,
                 traceback.format_exc(),
             )
@@ -380,6 +448,13 @@ class DatabaseLogger(object):
             )
             return
         self._logger.info("Database logger writer connected.")
+        try:
+            self._replace_queue_rows([])
+        except Exception:
+            self._logger.error(
+                "Failed to clear plugin_event_queue on start.\n\n%s",
+                traceback.format_exc(),
+            )
         next_flush = time.monotonic() + self._flush_interval
         while not self._stop.is_set():
             try:
@@ -387,6 +462,7 @@ class DatabaseLogger(object):
                 if self._flush_in_daemon and remaining <= 0:
                     self.flush_to_disk()
                     next_flush = time.monotonic() + self._flush_interval
+                    self._flush_queue_snapshot()
                     continue
                 timeout = 1.0
                 if self._flush_in_daemon:
@@ -400,6 +476,7 @@ class DatabaseLogger(object):
                     ):
                         self.flush_to_disk()
                         next_flush = time.monotonic() + self._flush_interval
+                self._flush_queue_snapshot()
             except Exception:
                 self._logger.error(
                     "Database logger writer error; continuing.\n\n%s",
@@ -424,6 +501,13 @@ class DatabaseLogger(object):
         except Exception:
             self._logger.error(
                 "Database logger flush failed while stopping.\n\n%s",
+                traceback.format_exc(),
+            )
+        try:
+            self._flush_queue_snapshot(force=True)
+        except Exception:
+            self._logger.error(
+                "Failed to flush plugin_event_queue while stopping.\n\n%s",
                 traceback.format_exc(),
             )
         finally:
@@ -507,6 +591,54 @@ class DatabaseLogger(object):
             if not batch:
                 return
             self._write_batch(batch)
+
+    def _flush_queue_snapshot(self, force=False):
+        now = time.monotonic()
+        with self._queue_snapshot_lock:
+            has_rows = any(self._queue_by_plugin.values())
+            heartbeat_due = (
+                has_rows
+                and (now - self._last_queue_write) >= _QUEUE_HEARTBEAT_SECONDS
+            )
+            if not force and not self._queue_snapshot_dirty and not heartbeat_due:
+                return
+            self._queue_snapshot_dirty = False
+            plugins = {
+                name: list(rows) for name, rows in self._queue_by_plugin.items()
+            }
+        reported_at = _naive_utc(
+            datetime.datetime.now(datetime.timezone.utc)
+        )
+        rows = []
+        for plugin_name, items in plugins.items():
+            for item in items:
+                try:
+                    rows.append(queue_item_to_row(plugin_name, item, reported_at))
+                except Exception:
+                    self._logger.error(
+                        "Skipping invalid queue snapshot row for plugin %s.\n\n%s",
+                        plugin_name,
+                        traceback.format_exc(),
+                    )
+        try:
+            self._replace_queue_rows(rows)
+            self._last_queue_write = now
+        except Exception:
+            with self._queue_snapshot_lock:
+                self._queue_snapshot_dirty = True
+            self._logger.error(
+                "Failed to replace plugin_event_queue snapshot.\n\n%s",
+                traceback.format_exc(),
+            )
+
+    def _replace_queue_rows(self, rows):
+        def _run(cursor):
+            cursor.execute(_DELETE_QUEUE_SQL)
+            if rows:
+                cursor.executemany(_INSERT_QUEUE_SQL, rows)
+
+        with self._db_lock:
+            self._run_with_retry(_run)
 
     def _truncate_memory(self):
         self._execute(_TRUNCATE_MEM_SQL)

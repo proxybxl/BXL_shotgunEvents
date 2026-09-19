@@ -404,12 +404,146 @@ class TestDatabaseLogger(unittest.TestCase):
             dbl.shutdown()
 
 
+    def _queue_item(self, event_id, status="processing", pending_count=0, **overrides):
+        started = datetime.datetime(2026, 9, 18, 19, 0, 0)
+        item = {
+            "event_id": event_id,
+            "event_type": "Shotgun_Task_Change",
+            "attribute_name": "sg_status_list",
+            "entity_type": "Task",
+            "entity_id": 7,
+            "entity_name": "Anim",
+            "project_id": 1,
+            "project_name": "Show",
+            "status": status,
+            "pending_count": pending_count,
+            "queued_at": started,
+            "started_at": started if status == "processing" else None,
+        }
+        item.update(overrides)
+        return item
+
+    def test_update_plugin_queue_writes_snapshot(self):
+        dbl = self._make_logger()
+        try:
+            dbl.update_plugin_queue(
+                "datestamp", [self._queue_item(42, pending_count=3)]
+            )
+            self._wait_for_writer(
+                dbl,
+                lambda: any(
+                    sql == db_logger._INSERT_QUEUE_SQL for sql, _ in self.conn.statements
+                ),
+            )
+            inserts = [
+                params
+                for sql, params in self.conn.statements
+                if sql == db_logger._INSERT_QUEUE_SQL
+            ]
+            self.assertEqual(len(inserts), 1)
+            row = inserts[0][0]
+            self.assertEqual(row[0], "datestamp")
+            self.assertEqual(row[1], 42)
+            self.assertEqual(row[2], "Shotgun_Task_Change")
+            self.assertEqual(row[9], "processing")
+            self.assertEqual(row[10], 3)
+            self.assertIsNotNone(row[13])
+        finally:
+            dbl.shutdown()
+
+    def test_empty_plugin_queue_deletes_without_insert(self):
+        dbl = self._make_logger()
+        try:
+            self._wait_for_writer(
+                dbl,
+                lambda: any(
+                    sql == db_logger._DELETE_QUEUE_SQL for sql, _ in self.conn.statements
+                ),
+            )
+            before = len(self.conn.statements)
+            dbl.update_plugin_queue("datestamp", [])
+            self._wait_for_writer(
+                dbl,
+                lambda: sum(
+                    1
+                    for sql, _ in self.conn.statements
+                    if sql == db_logger._DELETE_QUEUE_SQL
+                )
+                >= 2,
+            )
+            inserts_after = [
+                sql
+                for sql, _ in self.conn.statements[before:]
+                if sql == db_logger._INSERT_QUEUE_SQL
+            ]
+            self.assertEqual(inserts_after, [])
+        finally:
+            dbl.shutdown()
+
+    def test_latest_plugin_queue_snapshot_is_written(self):
+        dbl = self._make_logger()
+        try:
+            dbl.update_plugin_queue("calc_field", [self._queue_item(1)])
+            dbl.update_plugin_queue(
+                "calc_field",
+                [self._queue_item(2, status="pending", pending_count=1)],
+            )
+            deadline = datetime.datetime.now() + datetime.timedelta(seconds=3)
+            last_event_id = None
+            while datetime.datetime.now() < deadline:
+                inserts = [
+                    params
+                    for sql, params in self.conn.statements
+                    if sql == db_logger._INSERT_QUEUE_SQL
+                ]
+                if inserts:
+                    last_event_id = inserts[-1][0][1]
+                    if last_event_id == 2:
+                        return
+                threading.Event().wait(0.01)
+            self.fail(
+                "timed out waiting for latest queue snapshot, last event_id=%s"
+                % last_event_id
+            )
+        finally:
+            dbl.shutdown()
+
+
 class TestSqlHelpers(unittest.TestCase):
     def test_flush_sql_aggregates_memory_to_stats(self):
         sql = db_logger.flush_memory_table_sql()
         self.assertIn("INSERT INTO plugin_run_stats", sql)
         self.assertIn("FROM plugin_event_log_mem", sql)
         self.assertIn("GROUP BY plugin_name", sql)
+
+    def test_queue_item_to_row_converts_fields(self):
+        reported = datetime.datetime(2026, 9, 18, 19, 1, 0)
+        queued = datetime.datetime(2026, 9, 18, 19, 0, 0)
+        row = db_logger.queue_item_to_row(
+            "calc_field",
+            {
+                "event_id": "9",
+                "event_type": "Shotgun_Shot_Change",
+                "attribute_name": "code",
+                "entity_type": "Shot",
+                "entity_id": 15,
+                "entity_name": "SH010",
+                "project_id": 3,
+                "project_name": "Film",
+                "status": "pending",
+                "pending_count": 4,
+                "queued_at": queued,
+                "started_at": None,
+            },
+            reported,
+        )
+        self.assertEqual(row[0], "calc_field")
+        self.assertEqual(row[1], 9)
+        self.assertEqual(row[9], "pending")
+        self.assertEqual(row[10], 4)
+        self.assertEqual(row[11], queued)
+        self.assertIsNone(row[12])
+        self.assertEqual(row[13], reported)
 
 
 if __name__ == "__main__":

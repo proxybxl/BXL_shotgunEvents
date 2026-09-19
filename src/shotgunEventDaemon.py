@@ -40,6 +40,7 @@ import time
 import traceback
 import configparser
 import pickle
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 #
@@ -73,6 +74,10 @@ from shotgun_api3.lib.sgtimezone import SgTimezone
 import importlib_wrapper
 
 SG_TIMEZONE = SgTimezone()
+
+# How many pending events per plugin to persist in plugin_event_queue.
+# pending_count still reports the full depth.
+QUEUE_SNAPSHOT_PENDING_LIMIT = 200
 
 EMAIL_FORMAT_STRING = """Time: %(asctime)s
 Logger: %(name)s
@@ -1246,6 +1251,11 @@ class Plugin(object):
         # the engine's main thread nor any other plugin's queue.
         self._queue = queue.Queue()
         self._stopSentinel = object()
+        # Live work-queue snapshot for plugin_event_queue. Separate from
+        # self._queue because queue.Queue is not inspectable.
+        self._queue_state_lock = threading.Lock()
+        self._pending_events = deque()
+        self._current_event = None
         self._workerThread = threading.Thread(
             target=self._workerLoop,
             name="Plugin-%s" % self._pluginName,
@@ -1416,7 +1426,13 @@ class Plugin(object):
         processed.
         """
         self._lastDispatchedEventId = event["id"]
+        queued_at = datetime.datetime.now(datetime.timezone.utc).replace(
+            tzinfo=None
+        )
+        with self._queue_state_lock:
+            self._pending_events.append(self._summarize_event(event, queued_at))
         self._queue.put(event)
+        self._report_queue()
 
     def shutdown(self):
         """
@@ -1426,6 +1442,81 @@ class Plugin(object):
         if self._workerThread.is_alive():
             self._queue.put(self._stopSentinel)
             self._workerThread.join()
+        with self._queue_state_lock:
+            self._pending_events.clear()
+            self._current_event = None
+        self._report_queue()
+
+    def getQueueSnapshot(self):
+        """
+        Live processing + pending events for the database queue table.
+
+        Pending events beyond L{QUEUE_SNAPSHOT_PENDING_LIMIT} are omitted
+        from the row list; C{pending_count} still reflects the full depth.
+        """
+        with self._queue_state_lock:
+            pending_count = len(self._pending_events)
+            current = dict(self._current_event) if self._current_event else None
+            pending = []
+            for item, _ignored in zip(
+                self._pending_events, range(QUEUE_SNAPSHOT_PENDING_LIMIT)
+            ):
+                pending.append(dict(item))
+        rows = []
+        if current:
+            current["status"] = "processing"
+            current["pending_count"] = pending_count
+            rows.append(current)
+        for item in pending:
+            item["status"] = "pending"
+            item["pending_count"] = pending_count
+            rows.append(item)
+        return rows
+
+    def _summarize_event(self, event, queued_at):
+        entity = event.get("entity")
+        if not isinstance(entity, dict):
+            entity = {}
+        project = event.get("project")
+        if not isinstance(project, dict):
+            project = {}
+        return {
+            "event_id": event.get("id"),
+            "event_type": event.get("event_type"),
+            "attribute_name": event.get("attribute_name"),
+            "entity_type": entity.get("type"),
+            "entity_id": entity.get("id"),
+            "entity_name": entity.get("name") or entity.get("code"),
+            "project_id": project.get("id"),
+            "project_name": project.get("name"),
+            "queued_at": queued_at,
+            "started_at": None,
+        }
+
+    def _take_pending(self, event_id):
+        if self._pending_events and self._pending_events[0]["event_id"] == event_id:
+            return self._pending_events.popleft()
+        found = None
+        remaining = deque()
+        for item in self._pending_events:
+            if found is None and item["event_id"] == event_id:
+                found = item
+            else:
+                remaining.append(item)
+        self._pending_events = remaining
+        return found
+
+    def _report_queue(self):
+        db_logger_obj = self._engine.db_logger
+        if db_logger_obj is None:
+            return
+        try:
+            db_logger_obj.update_plugin_queue(self.getName(), self.getQueueSnapshot())
+        except Exception:
+            self.logger.error(
+                "Failed to report plugin queue snapshot.\n\n%s",
+                traceback.format_exc(),
+            )
 
     def _workerLoop(self):
         """
@@ -1443,6 +1534,16 @@ class Plugin(object):
                     return
 
                 event = item
+                started_at = datetime.datetime.now(datetime.timezone.utc).replace(
+                    tzinfo=None
+                )
+                with self._queue_state_lock:
+                    current = self._take_pending(event["id"])
+                    if current is None:
+                        current = self._summarize_event(event, started_at)
+                    current["started_at"] = started_at
+                    self._current_event = current
+                self._report_queue()
                 try:
                     self.process(event)
                 except Exception:
@@ -1457,6 +1558,10 @@ class Plugin(object):
                         traceback.format_exc(),
                     )
                     self.deactivate()
+                finally:
+                    with self._queue_state_lock:
+                        self._current_event = None
+                    self._report_queue()
             finally:
                 self._queue.task_done()
 
