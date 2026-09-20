@@ -27,14 +27,14 @@ _ERROR_TABLE_FULL = 1114
 _INSERT_MEM_SQL = (
     "INSERT INTO plugin_event_log_mem "
     "(plugin_name, duration_us, had_error) "
-    "VALUES (%s, %s, %s)"
+    "VALUES (?, ?, ?)"
 )
 
 _INSERT_EVENT_SQL = (
     "INSERT INTO plugin_event_log "
     "(event_id, plugin_name, started_at, duration_us, completed_at, "
     "had_error, log_reason, plugin_output) "
-    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 _TRUNCATE_MEM_SQL = "TRUNCATE TABLE plugin_event_log_mem"
@@ -47,7 +47,7 @@ _INSERT_QUEUE_SQL = (
     "entity_type, entity_id, entity_name, "
     "project_id, project_name, status, pending_count, "
     "queued_at, started_at, reported_at"
-    ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 # Re-write an unchanged snapshot at least this often so reported_at stays
@@ -60,7 +60,7 @@ _AGGREGATE_MEM_SQL = (
     "duration_us_min, duration_us_max, duration_us_sum, duration_us_avg"
     ") "
     "SELECT "
-    "%s, plugin_name, COUNT(*), COALESCE(SUM(had_error), 0), "
+    "?, plugin_name, COUNT(*), COALESCE(SUM(had_error), 0), "
     "MIN(duration_us), MAX(duration_us), SUM(duration_us), "
     "ROUND(AVG(duration_us)) "
     "FROM plugin_event_log_mem "
@@ -135,6 +135,8 @@ def _truncate_output(output, max_chars):
 
 
 def _is_table_full(err):
+    if getattr(err, "errno", None) == _ERROR_TABLE_FULL:
+        return True
     args = getattr(err, "args", ())
     if args and args[0] == _ERROR_TABLE_FULL:
         return True
@@ -191,7 +193,7 @@ class DatabaseLogger(object):
         @param logger: Logger used for DatabaseLogger diagnostics (file log).
         @type logger: L{logging.Logger}
         @param connect: Optional callable returning a DB connection. Defaults
-            to opening a MySQLdb connection from config.
+            to opening a mariadb connection from config.
         """
         self._logger = logger
         self._connect_factory = connect
@@ -253,7 +255,7 @@ class DatabaseLogger(object):
         self._last_queue_write = 0.0
 
     def start(self):
-        """Start the writer thread. The MySQL connection is opened on that thread."""
+        """Start the writer thread. The MariaDB connection is opened on that thread."""
         if self._writer_thread is not None and self._writer_thread.is_alive():
             return
         self._stop.clear()
@@ -404,22 +406,21 @@ class DatabaseLogger(object):
         if self._connect_factory is not None:
             return self._connect_factory()
         try:
-            import MySQLdb
+            import mariadb
         except ImportError:
             raise ImportError(
-                "MySQLdb is required for database logging. "
-                "Install mysqlclient or disable [database_log] in the config."
+                "mariadb is required for database logging. "
+                "Install the MariaDB Connector/Python package (mariadb) "
+                "or disable [database_log] in the config."
             )
-        conn = MySQLdb.connect(
+        conn = mariadb.connect(
             host=self._host,
             port=self._port,
             user=self._user,
-            passwd=self._password,
-            db=self._database,
-            charset="utf8mb4",
-            use_unicode=True,
+            password=self._password,
+            database=self._database,
         )
-        conn.autocommit(True)
+        conn.autocommit = True
         return conn
 
     def _close_connection(self):
@@ -437,7 +438,7 @@ class DatabaseLogger(object):
         return self._conn
 
     def _writer_loop(self):
-        # MySQLdb connections are not thread-safe and do not survive fork().
+        # mariadb connections are not thread-safe and do not survive fork().
         # Open the connection on this thread and do all SQL here.
         try:
             self._conn = self._open_connection()
@@ -576,7 +577,7 @@ class DatabaseLogger(object):
                 if events:
                     self._executemany(_INSERT_EVENT_SQL, events, chunk_size=100)
             self._logger.warning(
-                "plugin_event_log_mem was full (MySQL error 1114); aggregated "
+                "plugin_event_log_mem was full (MariaDB error 1114); aggregated "
                 "stats to plugin_run_stats and continued."
             )
         except Exception:
@@ -644,7 +645,10 @@ class DatabaseLogger(object):
         self._execute(_TRUNCATE_MEM_SQL)
 
     def _execute(self, sql, params=None):
-        self._run_with_retry(lambda cursor: cursor.execute(sql, params or ()))
+        if params is None:
+            self._run_with_retry(lambda cursor: cursor.execute(sql))
+        else:
+            self._run_with_retry(lambda cursor: cursor.execute(sql, params))
 
     def _executemany(self, sql, rows, chunk_size=None):
         if not rows:
