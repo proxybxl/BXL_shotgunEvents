@@ -30,6 +30,7 @@ class FakeConnection(object):
     def __init__(self):
         self.statements = []
         self.closed = False
+        self.autocommit = False
 
     def cursor(self):
         return FakeCursor(self)
@@ -334,6 +335,30 @@ class TestDatabaseLogger(unittest.TestCase):
         dbl.log_plugin_run(2, "b", started, 1, completed)
         self.assertGreaterEqual(dbl._dropped, 1)
 
+    def test_open_connection_uses_mariadb_connector(self):
+        conn = FakeConnection()
+        mock_mariadb = mock.MagicMock()
+        mock_mariadb.connect.return_value = conn
+        dbl = db_logger.DatabaseLogger(_config(), self.logger)
+        with mock.patch.dict("sys.modules", {"mariadb": mock_mariadb}):
+            opened = dbl._open_connection()
+        mock_mariadb.connect.assert_called_once_with(
+            host="localhost",
+            port=3306,
+            user="shotgun_events",
+            password="secret",
+            database="shotgun_events",
+        )
+        self.assertIs(opened, conn)
+        self.assertTrue(opened.autocommit)
+
+    def test_open_connection_requires_mariadb(self):
+        dbl = db_logger.DatabaseLogger(_config(), self.logger)
+        with mock.patch.dict("sys.modules", {"mariadb": None}):
+            with self.assertRaises(ImportError) as ctx:
+                dbl._open_connection()
+        self.assertIn("mariadb", str(ctx.exception))
+
     def test_naive_utc_converts_aware_datetime(self):
         aware = datetime.datetime(2026, 9, 16, 8, 0, 0, tzinfo=datetime.timezone.utc)
         naive = db_logger._naive_utc(aware)
@@ -515,6 +540,21 @@ class TestSqlHelpers(unittest.TestCase):
         self.assertIn("INSERT INTO plugin_run_stats", sql)
         self.assertIn("FROM plugin_event_log_mem", sql)
         self.assertIn("GROUP BY plugin_name", sql)
+
+    def test_sql_uses_qmark_placeholders(self):
+        self.assertIn("VALUES (?, ?, ?)", db_logger._INSERT_MEM_SQL)
+        self.assertNotIn("%s", db_logger._INSERT_MEM_SQL)
+        self.assertNotIn("%s", db_logger._INSERT_EVENT_SQL)
+        self.assertNotIn("%s", db_logger._INSERT_QUEUE_SQL)
+        self.assertIn("?, plugin_name", db_logger._AGGREGATE_MEM_SQL)
+
+    def test_is_table_full_reads_mariadb_errno(self):
+        err = type("MariaDBError", (Exception,), {"errno": 1114})(
+            "The table 'plugin_event_log_mem' is full"
+        )
+        self.assertTrue(db_logger._is_table_full(err))
+        other = type("MariaDBError", (Exception,), {"errno": 1062})("Duplicate")
+        self.assertFalse(db_logger._is_table_full(other))
 
     def test_queue_item_to_row_converts_fields(self):
         reported = datetime.datetime(2026, 9, 18, 19, 1, 0)
