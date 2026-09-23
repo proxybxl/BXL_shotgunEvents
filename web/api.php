@@ -125,7 +125,7 @@ if ($action === 'queue') {
         $stmt = $pdo->query(
             'SELECT plugin_name, event_id, event_type, attribute_name, '
             . 'entity_type, entity_id, entity_name, project_id, project_name, '
-            . 'status, pending_count, queued_at, started_at, reported_at '
+            . 'status, pending_count, created_at, queued_at, started_at, reported_at '
             . 'FROM plugin_event_queue '
             . 'ORDER BY FIELD(status, \'processing\', \'pending\'), '
             . 'plugin_name ASC, event_id ASC'
@@ -138,11 +138,10 @@ if ($action === 'queue') {
     $processing = [];
     $pending = [];
     $pendingByPlugin = [];
-    $plugins = [];
+    $busyPlugins = [];
     $reportedAt = null;
     foreach ($rows as $row) {
         $plugin = (string) $row['plugin_name'];
-        $plugins[$plugin] = true;
         $pendingByPlugin[$plugin] = max(
             $pendingByPlugin[$plugin] ?? 0,
             (int) $row['pending_count']
@@ -151,6 +150,12 @@ if ($action === 'queue') {
             $reportedAt = $row['reported_at'];
         }
         if ($row['status'] === 'processing') {
+            // Only a row actually being worked counts as "busy" - a plugin
+            // with only pending (not yet picked up) rows isn't, even though
+            // it has queued work. Counting all rows' plugins here previously
+            // made this number disagree with the "Currently processing"
+            // table, which is built from $processing alone.
+            $busyPlugins[$plugin] = true;
             $processing[] = $row;
         } else {
             $pending[] = $row;
@@ -164,7 +169,7 @@ if ($action === 'queue') {
         'counts' => [
             'processing' => count($processing),
             'pending' => array_sum($pendingByPlugin),
-            'plugins' => count($plugins),
+            'plugins' => count($busyPlugins),
         ],
     ]);
     exit;

@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS plugin_event_queue (
     id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     plugin_name     VARCHAR(255) NOT NULL,
     event_id        BIGINT NOT NULL,
+    created_at      DATETIME(6) NULL,
     event_type      VARCHAR(255) NULL,
     attribute_name  VARCHAR(255) NULL,
     entity_type     VARCHAR(64) NULL,
@@ -34,3 +35,9 @@ CREATE TABLE IF NOT EXISTS plugin_event_queue (
 ) ENGINE=InnoDB
   DEFAULT CHARSET=utf8mb4
   COLLATE=utf8mb4_unicode_ci;
+
+-- Existing installs: add the Shotgun/FPT event creation time so the
+-- dashboard can show total latency (created_at -> now), not just time on
+-- this daemon's own queue (queued_at -> now/started_at).
+ALTER TABLE plugin_event_queue
+    ADD COLUMN IF NOT EXISTS created_at DATETIME(6) NULL AFTER event_id;

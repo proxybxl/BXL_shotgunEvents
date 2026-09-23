@@ -1524,6 +1524,15 @@ class Plugin(object):
         project = event.get("project")
         if not isinstance(project, dict):
             project = {}
+        # Shotgun/Flow Production Tracker returns created_at tz-aware; store
+        # it naive-UTC like queued_at/started_at so the dashboard can diff
+        # them directly (time since generated in FPT vs. time on this
+        # plugin's queue).
+        created_at = event.get("created_at")
+        if created_at is not None and created_at.tzinfo is not None:
+            created_at = created_at.astimezone(datetime.timezone.utc).replace(
+                tzinfo=None
+            )
         return {
             "event_id": event.get("id"),
             "event_type": event.get("event_type"),
@@ -1533,6 +1542,7 @@ class Plugin(object):
             "entity_name": entity.get("name") or entity.get("code"),
             "project_id": project.get("id"),
             "project_name": project.get("name"),
+            "created_at": created_at,
             "queued_at": queued_at,
             "started_at": None,
         }
