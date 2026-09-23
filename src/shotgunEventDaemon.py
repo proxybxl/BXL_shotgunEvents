@@ -34,6 +34,7 @@ import logging.handlers
 import os
 import pprint
 import queue
+import signal
 import socket
 import sys
 import time
@@ -417,6 +418,23 @@ class Engine(object):
             secure,
         )
 
+    def _handleShutdownSignal(self, signum, frame):
+        """
+        Signal handler for SIGINT (Ctrl+C) and SIGUSR1.
+
+        Runs on the main thread, which is where _mainLoop() blocks (on a
+        Shotgun request or on time.sleep()). Raising KeyboardInterrupt here
+        unwinds that blocking call immediately instead of waiting for it to
+        return on its own, and is caught by the except clause in start()
+        below, which does the actual plugin-thread shutdown and state flush.
+        """
+        try:
+            signame = signal.Signals(signum).name
+        except ValueError:
+            signame = str(signum)
+        self.log.warning("Received %s. Requesting shutdown...", signame)
+        raise KeyboardInterrupt()
+
     def start(self):
         """
         Start the processing of events.
@@ -430,6 +448,10 @@ class Engine(object):
         # Notify which version of shotgun api we are using
         self.log.info("Using SG Python API version %s" % sg.__version__)
 
+        signal.signal(signal.SIGINT, self._handleShutdownSignal)
+        if hasattr(signal, "SIGUSR1"):
+            # Not available on Windows.
+            signal.signal(signal.SIGUSR1, self._handleShutdownSignal)
         # Runs here (not Engine.__init__) so the writer/flush threads are
         # created in the actual daemon process, after daemonize()'s fork -
         # see the comment in __init__ for why starting them any earlier
@@ -453,7 +475,16 @@ class Engine(object):
 
             self._mainLoop()
         except KeyboardInterrupt:
-            self.log.warning("Keyboard interrupt. Cleaning up...")
+            self.log.warning(
+                "Shutdown requested. Aborting all plugin threads..."
+            )
+            # Stops every plugin's worker thread and flushes the resulting
+            # event state to disk - see stop() for details.
+            self.stop()
+            self.log.warning(
+                "All plugin threads stopped and event state flushed. Exiting."
+            )
+
             # Fire-and-forget: a blocking send_slack_message() call
             # here would hold up shutdown itself if Slack (or the
             # network) is slow to respond, forcing a second Ctrl+C to
@@ -772,6 +803,18 @@ class Engine(object):
         self.log.debug("Shuting down event processing loop.")
 
     def stop(self):
+        """
+        Stop the main loop and every plugin's worker thread, waiting for
+        whatever event each plugin is currently in the middle of to finish
+        first (see L{PluginCollection.shutdown}/L{Plugin.shutdown}).
+
+        Once every plugin has drained, persist the state each one actually
+        reached so a restart resumes from there instead of replaying
+        already-processed events. This is the single place all of SIGTERM
+        (via L{LinuxDaemon._cleanup}), SIGINT/SIGUSR1 (see L{start}) and the
+        Windows service's SvcStop route through, so the flush happens no
+        matter which of those triggered the shutdown.
+        """
         if not self._continue:
             # Already stopped, or a stop is already underway. daemonizer.Daemon
             # calls _cleanup() (which calls this) from two independent places:
@@ -794,6 +837,7 @@ class Engine(object):
         self._continue = False
         for collection in self._pluginCollections:
             collection.shutdown()
+        self._saveEventIdData()
 
         if self.db_logger is not None:
             self.db_logger.shutdown()
