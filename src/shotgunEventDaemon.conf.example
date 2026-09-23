@@ -62,6 +62,57 @@ fetch_interval = 5
 max_event_batch_size = 500
 
 
+[database_log]
+# MariaDB logging in addition to file logging (file logging is not replaced).
+#
+# Per-minute stats for every plugin that actually invokes a callback:
+#   plugin_run_stats  (run count, error count, min/avg/max duration)
+#
+# Per-event rows are written only when a callback errors, or when a plugin
+# opts in from registerCallbacks:
+#   reg.enableDatabaseEventLog()
+# See src/examplePlugins/logArgs.py.
+#
+# plugin_event_queue is a live snapshot of each plugin's current event and
+# the events still waiting on its worker. The dashboard Queue view reads it.
+#
+# Create / update tables:
+#   mysql -u root -p < sql/plugin_event_log.sql
+# Existing installs must recreate the MEMORY buffer:
+#   mysql -u root -p shotgun_events < sql/plugin_event_log_recreate_mem.sql
+# Existing installs that only need the queue table:
+#   mysql -u root -p shotgun_events < sql/plugin_event_queue.sql
+#
+# Compact samples go to plugin_event_log_mem and are aggregated once a minute.
+enabled: False
+
+host: localhost
+port: 3306
+database: shotgun_events
+user: shotgun_events
+password: change_me
+
+# Seconds between MEMORY -> plugin_run_stats aggregates. 60 = one minute.
+# flush_interval_seconds: 60
+
+# Emergency aggregate if the MEMORY buffer reaches this many samples before
+# the interval elapses. Default 250000. At ~2000 runs/sec that is ~2 minutes.
+# flush_row_threshold: 250000
+
+# Rows pulled off the in-process queue per INSERT into the MEMORY buffer.
+# batch_size: 1000
+
+# Max queued plugin runs waiting to be written. Extra runs are dropped.
+# queue_maxsize: 50000
+
+# Cap captured plugin logger output stored in the archive (characters).
+# max_output_chars: 1048576
+
+# Set to False only if you enable the MariaDB EVENT in plugin_event_log.sql
+# instead of letting the daemon flush. Do not run both or rows will duplicate.
+# flush_in_daemon: True
+
+
 [shotgun]
 # Shotgun connection options for the daemon
 
