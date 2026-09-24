@@ -94,3 +94,8 @@ CREATE TABLE IF NOT EXISTS plugin_event_queue (
 ) ENGINE=InnoDB
   DEFAULT CHARSET=utf8mb4
   COLLATE=utf8mb4_unicode_ci;
+
+-- Shotgun/FPT event creation time, for the dashboard's "since generated"
+-- latency column - distinct from queued_at (when this daemon enqueued it).
+ALTER TABLE plugin_event_queue
+    ADD COLUMN IF NOT EXISTS created_at DATETIME(6) NULL AFTER event_id;

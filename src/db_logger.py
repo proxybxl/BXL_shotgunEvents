@@ -46,8 +46,8 @@ _INSERT_QUEUE_SQL = (
     "plugin_name, event_id, event_type, attribute_name, "
     "entity_type, entity_id, entity_name, "
     "project_id, project_name, status, pending_count, "
-    "queued_at, started_at, reported_at"
-    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "created_at, queued_at, started_at, reported_at"
+    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 # Re-write an unchanged snapshot at least this often so reported_at stays
@@ -165,6 +165,7 @@ def queue_item_to_row(plugin_name, item, reported_at):
         item.get("project_name"),
         item.get("status"),
         int(item.get("pending_count") or 0),
+        _naive_utc(item.get("created_at")),
         _naive_utc(item.get("queued_at")),
         _naive_utc(item.get("started_at")),
         reported_at,

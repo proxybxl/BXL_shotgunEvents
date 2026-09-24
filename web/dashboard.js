@@ -213,17 +213,51 @@
         return d.toLocaleString();
     }
 
-    function formatElapsed(raw) {
-        if (!raw) return '—';
-        const d = new Date(String(raw).replace(' ', 'T') + 'Z');
-        if (Number.isNaN(d.getTime())) return '—';
-        const seconds = Math.max(0, Math.round((Date.now() - d.getTime()) / 1000));
+    function formatDurationMs(ms) {
+        const seconds = Math.max(0, Math.round(ms / 1000));
         if (seconds < 60) return `${seconds}s`;
         const minutes = Math.floor(seconds / 60);
         const rem = seconds % 60;
         if (minutes < 60) return `${minutes}m ${rem}s`;
         const hours = Math.floor(minutes / 60);
         return `${hours}h ${minutes % 60}m`;
+    }
+
+    function parseUtc(raw) {
+        if (!raw) return null;
+        const d = new Date(String(raw).replace(' ', 'T') + 'Z');
+        return Number.isNaN(d.getTime()) ? null : d;
+    }
+
+    function formatElapsed(raw) {
+        const d = parseUtc(raw);
+        if (!d) return '—';
+        return formatDurationMs(Date.now() - d.getTime());
+    }
+
+    // Time this row has spent on the daemon's own in-memory queue: while
+    // pending that's still growing (queued_at -> now); once a worker has
+    // picked it up it's a fixed span (queued_at -> started_at).
+    function formatQueueWait(row) {
+        const queuedAt = parseUtc(row.queued_at);
+        if (!queuedAt) return '—';
+        const startedAt = row.status === 'processing' ? parseUtc(row.started_at) : null;
+        const endMs = startedAt ? startedAt.getTime() : Date.now();
+        return formatDurationMs(Math.max(0, endMs - queuedAt.getTime()));
+    }
+
+    // Time actually being worked on by the plugin (started_at -> now) -
+    // '—' for rows still waiting in the pending table.
+    function formatProcessingTime(row) {
+        if (row.status !== 'processing' || !row.started_at) return '—';
+        return formatElapsed(row.started_at);
+    }
+
+    // Total age since Flow Production Tracker generated the event
+    // (created_at -> now) - includes SG-side delay and this daemon's fetch
+    // cadence, on top of time spent on this plugin's own queue.
+    function formatSinceGenerated(row) {
+        return formatElapsed(row.created_at);
     }
 
     function entityLabel(row) {
@@ -277,7 +311,9 @@
                 <td>${escapeHtml(entityLabel(row))}</td>
                 <td>${escapeHtml(projectLabel(row))}</td>
                 <td>${escapeHtml(formatUtc(row.queued_at))}</td>
-                <td>${escapeHtml(status === 'processing' ? formatElapsed(row.started_at) : formatElapsed(row.queued_at))}</td>
+                <td>${escapeHtml(formatQueueWait(row))}</td>
+                <td>${escapeHtml(formatProcessingTime(row))}</td>
+                <td>${escapeHtml(formatSinceGenerated(row))}</td>
             </tr>`;
         }).join('');
         return `<table class="queue-table">
@@ -291,7 +327,9 @@
                     <th>Entity</th>
                     <th>Project</th>
                     <th>Queued</th>
-                    <th>${rows[0] && rows[0].status === 'processing' ? 'Running' : 'Waiting'}</th>
+                    <th>On queue</th>
+                    <th>Processing</th>
+                    <th>Since generated</th>
                 </tr>
             </thead>
             <tbody>${body}</tbody>
