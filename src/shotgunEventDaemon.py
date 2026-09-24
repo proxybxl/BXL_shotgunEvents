@@ -51,6 +51,7 @@ print("Boxel adding third party modules")
 packages = r"/srv/shotgunEvents-master/src/site-packages"
 if packages not in sys.path:
     sys.path.append(packages)
+import setuptools
 
 print("Boxel adding triggers modules")
 sys.path.append(r"/srv/shotgunEvents-master/src/bxl_triggers")
