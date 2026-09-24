@@ -25,6 +25,7 @@
     let autoRefreshTimer = null;
     let queueRefreshTimer = null;
     let knownPlugins = [];
+    let knownQueuePlugins = [];
     let currentView = 'stats';
     let lastQueueData = null;
 
@@ -61,6 +62,10 @@
             setStatus('Failed to load plugin list.');
             return;
         }
+
+        knownPlugins.forEach((name) => {
+            if (!knownQueuePlugins.includes(name)) knownQueuePlugins.push(name);
+        });
 
         pluginCheckboxes.innerHTML = '';
         if (knownPlugins.length === 0) {
@@ -280,9 +285,15 @@
     }
 
     function updateQueuePluginFilter(data) {
-        const names = new Set();
+        // Union of every plugin ever seen (cached from the stats tab's plugin
+        // list, plus any queue-only names) with whatever's in this snapshot,
+        // so a plugin with no processing/pending rows right now doesn't
+        // vanish from the filter. Kept separate from `knownPlugins` so this
+        // doesn't affect the stats tab's "all checkboxes selected" check.
+        const names = new Set(knownQueuePlugins);
         (data.processing || []).forEach((row) => names.add(row.plugin_name));
         (data.pending || []).forEach((row) => names.add(row.plugin_name));
+        knownQueuePlugins = Array.from(names);
         const current = queuePluginFilter.value;
         queuePluginFilter.innerHTML = '<option value="">All plugins</option>';
         Array.from(names).sort().forEach((name) => {
