@@ -436,6 +436,46 @@ class Engine(object):
         self.log.warning("Received %s. Requesting shutdown...", signame)
         raise KeyboardInterrupt()
 
+    def _forceShutdownIfStuck(self):
+        """
+        Watchdog fallback for the SIGINT/SIGUSR1 shutdown path in start().
+
+        Only runs if the process hasn't already exited normally within the
+        grace period that timer was started with, meaning something is
+        genuinely stuck - a plugin's worker thread wedged on its current
+        event (blocking stop()'s join() on it), the Slack notification
+        thread, or something else entirely (e.g. the main thread itself,
+        if it's atexit/logging shutdown machinery that's stuck). Every
+        plugin's worker thread is named "Plugin-<pluginName>" (see
+        Plugin.__init__), so whichever one shows up here (if any)
+        identifies the plugin directly; everything else still alive is
+        reported by its own thread name. For every one of them, log the
+        stack it's currently sitting in so it's clear what it was doing,
+        then force the process to actually finish - there is no supported
+        way in Python to kill an individual thread, so ending the whole
+        process is the only way to actually get rid of a thread that
+        won't stop on its own.
+        """
+        frames = sys._current_frames()
+        watchdogThread = threading.current_thread()
+        for thread in threading.enumerate():
+            if thread is watchdogThread or not thread.is_alive():
+                continue
+            frame = frames.get(thread.ident)
+            where = (
+                "".join(traceback.format_stack(frame))
+                if frame is not None
+                else "<no stack available>"
+            )
+            self.log.critical(
+                "Shutdown watchdog: forcing exit - thread %r (%s) is still "
+                "stuck.\n\n%s",
+                thread.name,
+                "daemon" if thread.daemon else "non-daemon",
+                where,
+            )
+        os._exit(1)
+
     def start(self):
         """
         Start the processing of events.
@@ -479,6 +519,20 @@ class Engine(object):
             self.log.warning(
                 "Shutdown requested. Aborting all plugin threads..."
             )
+
+            # Guard the whole shutdown sequence below with a watchdog,
+            # started before stop() rather than after: stop() itself can
+            # block forever inside a plugin's worker-thread join() if that
+            # plugin's current callback is the thing that's actually
+            # wedged (e.g. stuck on a slow/blocked call), and the Slack
+            # notification thread further below has the same risk (see
+            # its comment). In the normal case this timer never fires -
+            # it's simply abandoned once the process exits on its own,
+            # which should happen well within the grace period below.
+            watchdog = threading.Timer(15, self._forceShutdownIfStuck)
+            watchdog.daemon = True
+            watchdog.start()
+
             # Stops every plugin's worker thread and flushes the resulting
             # event state to disk - see stop() for details.
             self.stop()
@@ -492,10 +546,17 @@ class Engine(object):
             # actually kill the process instead of exiting cleanly -
             # observed directly once already (the traceback showed
             # this call still stuck in sock.connect() when the second
-            # KeyboardInterrupt landed).
+            # KeyboardInterrupt landed). Marking the thread as a daemon
+            # is meant to let the process exit without waiting on it,
+            # but that's only a hint to the interpreter, not a
+            # guarantee - it can still be left waiting on this (or any
+            # other) thread depending on what that thread is doing when
+            # shutdown runs. The watchdog started above is what actually
+            # guarantees the process finishes either way.
             threading.Thread(
                 target=slack_msj.send_slack_message,
                 args=("Boxel site: Daemon stopped by user.",),
+                name="SlackNotifier",
                 daemon=True,
             ).start()
         except Exception as err:
