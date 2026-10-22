@@ -2345,6 +2345,45 @@ class LinuxDaemon(daemonizer.Daemon):
         self._engine.stop()
 
 
+# Mirrors bxl_triggers/base_trigger.py's site-detection default mapping -
+# duplicated here (not imported) to avoid coupling this daemon to the
+# bxl_triggers package/repo just for one Slack message label. Boxel's
+# servers resolve with no domain at all (so "no domain" defaults to
+# Boxel), Centergrid's resolve under centergrid.boxel.lan.
+_SITE_DOMAIN_MAP = {
+    "Boxel": ["boxel.lan", "No domain found (Localhost/Workgroup)"],
+    "Centergrid": ["centergrid.boxel.lan"],
+}
+
+_site_name_cache = None
+
+
+def _resolve_site_name():
+    """Best-effort site label ("Boxel"/"Centergrid") for Slack messages.
+
+    Cached at module level - the machine's own domain never changes
+    within a process. Falls back to "Boxel" for any unrecognized
+    domain, matching this file's own prior hardcoded behavior.
+    """
+    global _site_name_cache
+    if _site_name_cache is not None:
+        return _site_name_cache
+
+    fqdn = socket.getfqdn()
+    domain = (
+        fqdn.split(".", 1)[1]
+        if "." in fqdn
+        else "No domain found (Localhost/Workgroup)"
+    )
+
+    _site_name_cache = "Boxel"
+    for site_name, domains in _SITE_DOMAIN_MAP.items():
+        if domain in domains:
+            _site_name_cache = site_name
+            break
+    return _site_name_cache
+
+
 def main():
     """ """
     action = None
@@ -2361,7 +2400,8 @@ def main():
     if action:
         try:
             slack_msj.send_slack_message(
-                "Boxel Server: Executing shotgunEventDaemon action: {}".format(action))
+                "{} Server: Executing shotgunEventDaemon action: {}".format(
+                    _resolve_site_name(), action))
         except Exception as e:
             pass  # Ignore Slack errors
 
