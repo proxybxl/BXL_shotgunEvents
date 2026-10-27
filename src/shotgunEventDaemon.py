@@ -81,6 +81,14 @@ SG_TIMEZONE = SgTimezone()
 # pending_count still reports the full depth.
 QUEUE_SNAPSHOT_PENDING_LIMIT = 200
 
+# Maximum event-id lag a single plugin in a collection may have behind
+# its sibling plugins' max lastEventId when loading state from disk
+# before being fast-forwarded to the collection's current max cursor.
+# Prevents a plugin that was inactive/unregistered for hours or days
+# from rewinding the entire daemon hundreds of thousands of events into
+# the past when re-enabled.
+MAX_STALE_PLUGIN_LAG = 5000
+
 EMAIL_FORMAT_STRING = """Time: %(asctime)s
 Logger: %(name)s
 Path: %(pathname)s
@@ -591,6 +599,12 @@ class Engine(object):
                     # last processed id.
                     noStateCollections = []
                     for collection in self._pluginCollections:
+                        if not list(collection):
+                            # An empty plugin directory on disk has `{}`
+                            # state; skipping it avoids treating it as a
+                            # missing-state collection and querying SG
+                            # for lastEventId on every _mainLoop() pass.
+                            continue
                         state = self._eventIdData.get(collection.path)
                         if state:
                             collection.setState(state)
@@ -949,6 +963,8 @@ class Engine(object):
             # this can't safely exclude anything.
             registeredEventTypes = self._getRegisteredEventTypes()
             if registeredEventTypes is not None:
+                if not registeredEventTypes:
+                    return []
                 filters.append(
                     ["event_type", "in", sorted(registeredEventTypes)])
 
@@ -1158,6 +1174,54 @@ class PluginCollection(object):
         self._plugins = {}
         self._stateData = {}
 
+    def _getMaxStateEventId(self):
+        max_event_id = None
+        if not isinstance(self._stateData, dict):
+            return None
+        for val in self._stateData.values():
+            cand_id = (
+                val[0]
+                if isinstance(val, tuple) and val
+                else (val if isinstance(val, int) else None)
+            )
+            if isinstance(cand_id, int) and (
+                max_event_id is None or cand_id > max_event_id
+            ):
+                max_event_id = cand_id
+        return max_event_id
+
+    def _normalizePluginState(self, plugin, pluginState, max_event_id):
+        if pluginState:
+            cand_id = (
+                pluginState[0]
+                if isinstance(pluginState, tuple) and pluginState
+                else (pluginState if isinstance(pluginState, int) else None)
+            )
+            if (
+                max_event_id is not None
+                and isinstance(cand_id, int)
+                and (max_event_id - cand_id) > MAX_STALE_PLUGIN_LAG
+            ):
+                if plugin._lastDispatchedEventId is None:
+                    self._engine.log.warning(
+                        "Plugin %s lastEventId (%d) is %d events behind "
+                        "collection max (%d); fast-forwarding to %d.",
+                        plugin.getName(),
+                        cand_id,
+                        max_event_id - cand_id,
+                        max_event_id,
+                        max_event_id,
+                    )
+                fast_forwarded = (max_event_id, {})
+                self._stateData[plugin.getName()] = fast_forwarded
+                return fast_forwarded
+            return pluginState
+        if max_event_id is not None:
+            fast_forwarded = (max_event_id, {})
+            self._stateData[plugin.getName()] = fast_forwarded
+            return fast_forwarded
+        return None
+
     def setState(self, state):
         if isinstance(state, int):
             for plugin in self:
@@ -1165,8 +1229,12 @@ class PluginCollection(object):
                 self._stateData[plugin.getName()] = plugin.getState()
         else:
             self._stateData = state
+            max_event_id = self._getMaxStateEventId()
             for plugin in self:
                 pluginState = self._stateData.get(plugin.getName())
+                pluginState = self._normalizePluginState(
+                    plugin, pluginState, max_event_id
+                )
                 if pluginState:
                     plugin.setState(pluginState)
 
@@ -1469,6 +1537,13 @@ class Plugin(object):
             callbacks = list(self._callbacks)
 
         if not callbacks:
+            # A plugin that loaded cleanly without registering any
+            # callbacks (e.g. should_register_on_this_host() returned
+            # False for this site) cares about zero event types, not all
+            # of them - returning None here would disable the event_type
+            # filter in Engine._getNewEvents() for the entire daemon.
+            return set()
+        elif False:
             return None
 
         event_types = set()

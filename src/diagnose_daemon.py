@@ -1037,7 +1037,7 @@ def _dry_run_plugin_registration(plugin_file, sg):
 
 
 def _write_and_send_diagnostic_report(
-    report_text, send_slack=True, target_plugin=None
+    report_text, send_slack=True, target_plugin=None, applied_repairs=None
 ):
     """Save diagnostic output to a .txt file and upload it to #log-pipe-triggers."""
     hostname = socket.gethostname()
@@ -1090,6 +1090,11 @@ def _write_and_send_diagnostic_report(
     )
     if target_plugin:
         slack_header += f"\n     • *Target plugin:* `{target_plugin}`"
+    if applied_repairs:
+        repairs_str = "\n".join(f"       - :wrench: {r}" for r in applied_repairs)
+        slack_header += (
+            f"\n     • *Repairs applied ({len(applied_repairs)}):*\n{repairs_str}"
+        )
     if warning_lines:
         preview = "\n".join(f"       - {w}" for w in warning_lines[:5])
         slack_header += f"\n     • *Summary:*\n{preview}"
@@ -1322,7 +1327,9 @@ def run_fix(config, latest_sg_event_id, apply=False, assume_yes=False):
     _banner("Repair " + ("(applying)" if apply else "plan (dry run, use --apply)"))
     if apply and os.geteuid() != 0:
         print("[WARNING] --apply needs root: run it with sudo. Nothing done.")
-        return
+        return []
+
+    applied_repairs = []
 
     def step(description, action):
         print(f"\n- {description}")
@@ -1337,6 +1344,7 @@ def run_fix(config, latest_sg_event_id, apply=False, assume_yes=False):
         try:
             action()
             print("  Done.")
+            applied_repairs.append(description)
             return True
         except Exception:
             print(f"  [WARNING] Failed:\n{traceback.format_exc()}")
@@ -1374,9 +1382,15 @@ def run_fix(config, latest_sg_event_id, apply=False, assume_yes=False):
         def stop_daemon(pid=pid):
             os.kill(pid, signal.SIGTERM)
             if not _wait_for_exit(pid, DAEMON_STOP_TIMEOUT_SECONDS):
-                raise RuntimeError(
-                    f"daemon {pid} still alive after "
-                    f"{DAEMON_STOP_TIMEOUT_SECONDS}s; stop it by hand")
+                print(
+                    f"  daemon {pid} still alive after "
+                    f"{DAEMON_STOP_TIMEOUT_SECONDS}s; sending SIGKILL"
+                )
+                os.kill(pid, signal.SIGKILL)
+                if not _wait_for_exit(pid, 10):
+                    raise RuntimeError(
+                        f"daemon {pid} still alive after SIGKILL; "
+                        "stop it by hand")
 
         step(f"Extra daemon {pid} (keeping {keep_daemon}): SIGTERM and wait "
              "for it to drain its queues and save its state", stop_daemon)
@@ -1476,6 +1490,7 @@ def run_fix(config, latest_sg_event_id, apply=False, assume_yes=False):
     elif not apply:
         print(f"\n{planned} repair(s) planned. Run again with "
               "'sudo ... --fix --apply' to apply them.")
+    return applied_repairs
 
 
 def main():
@@ -1521,8 +1536,27 @@ def main():
     )
     args = parser.parse_args()
 
+    lock_fh = None
+    try:
+        import fcntl
+        lock_path = os.path.join(
+            tempfile.gettempdir(), "shotgunEventDaemon_diagnose.lock"
+        )
+        lock_fh = open(lock_path, "w")
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except ImportError:
+        pass
+    except OSError:
+        print(
+            "Another diagnose_daemon.py instance is already running; exiting."
+        )
+        if lock_fh is not None:
+            lock_fh.close()
+        return
+
     tee = _TeeStdout(sys.stdout)
     sys.stdout = tee
+    applied_repairs = []
     try:
         config = read_config(CONF_PATH)
         print(f"Diagnosing daemon using {CONF_PATH}")
@@ -1553,7 +1587,7 @@ def main():
             )
 
         if args.fix:
-            run_fix(
+            applied_repairs = run_fix(
                 config,
                 latest_sg_event_id,
                 apply=args.apply,
@@ -1564,11 +1598,17 @@ def main():
         print("Done.")
     finally:
         sys.stdout = tee._real
+        if lock_fh is not None:
+            try:
+                lock_fh.close()
+            except Exception:
+                pass
 
     _write_and_send_diagnostic_report(
         tee.getvalue(),
         send_slack=not args.no_slack,
         target_plugin=args.plugin,
+        applied_repairs=applied_repairs,
     )
 
 

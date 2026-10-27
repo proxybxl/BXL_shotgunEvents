@@ -87,7 +87,21 @@ class Daemon(object):
 
     def _delpid(self):
         if os.path.exists(self._pidfile):
-            os.remove(self._pidfile)
+            remove_pidfile = True
+            try:
+                with open(self._pidfile, "r") as pf:
+                    owner_pid = int(pf.read().strip())
+                if owner_pid != os.getpid():
+                    try:
+                        os.kill(owner_pid, 0)
+                        # Another live process owns this pidfile; do not delete it
+                        remove_pidfile = False
+                    except OSError:
+                        pass
+            except (IOError, ValueError):
+                pass
+            if remove_pidfile and os.path.exists(self._pidfile):
+                os.remove(self._pidfile)
 
         subsysPath = os.path.join("/var/lock/subsys", self._serviceName)
         if os.path.exists(subsysPath):
@@ -103,13 +117,24 @@ class Daemon(object):
         try:
             with open(self._pidfile, "r") as pf:
                 pid = int(pf.read().strip())
-        except IOError:
+        except (IOError, ValueError):
             pid = None
 
         if pid:
-            message = "pidfile %s already exist. Daemon already running?\n"
-            sys.stderr.write(message % self._pidfile)
-            sys.exit(1)
+            pid_alive = True
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                pid_alive = False
+            if pid_alive:
+                message = "pidfile %s already exist. Daemon already running?\n"
+                sys.stderr.write(message % self._pidfile)
+                sys.exit(1)
+            else:
+                try:
+                    os.remove(self._pidfile)
+                except OSError:
+                    pass
 
         # Start the daemon
         if daemonize:
