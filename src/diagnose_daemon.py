@@ -2,8 +2,8 @@
 # Copyright (c) 2026 Boxel Studio.
 #
 # :Module: diagnose_daemon.py
-# :Description: Standalone, read-only diagnostic for the ShotGrid event
-#               daemon. Reads shotgunEventDaemon.conf next to this file,
+# :Description: Standalone diagnostic for the ShotGrid event daemon
+#               (read-only unless --fix --apply). Reads shotgunEventDaemon.conf next to this file,
 #               inspects OS processes and pidfiles (detecting duplicate
 #               daemon/supervisor instances), validates host/FQDN site
 #               resolution against ShotGrid's BXL_Trigger_hosts config,
@@ -23,6 +23,13 @@
 #                           BXL_version_download_vendor)
 #                 --test-plugin (dry-run registration/site check for
 #                                --plugin without sending Slack alerts)
+#                 --fix (print the repair plan) / --fix --apply (run it,
+#                        needs sudo, asks before each repair) / --yes
+#               Repairs: duplicate supervisor/daemon processes, missing
+#               or stale pidfiles, an unloadable eventIdFile (rebuilt
+#               from plugin_event_queue or the logs), a stuck main loop
+#               and a stopped daemon. Plugin cursors and backlogs are
+#               never rewritten.
 #
 # :Author: Fidel Moreno Miranda <fidel.moreno@boxelstudio.com>
 #
@@ -32,12 +39,16 @@ import argparse
 import configparser
 import datetime
 import glob
+import io
 import json
 import os
 import pickle
+import re
+import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 
@@ -52,6 +63,9 @@ _TRIGGERS_DIR = "/srv/shotgunEvents-master/src/bxl_triggers"
 if _TRIGGERS_DIR not in sys.path and os.path.isdir(_TRIGGERS_DIR):
     sys.path.append(_TRIGGERS_DIR)
 
+# log-pipe-triggers Slack channel ID (matches BaseTrigger.ERROR_CHANNEL_ID)
+LOG_PIPE_TRIGGERS_CHANNEL_ID = "C08UT5TSH33"
+
 CONF_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "shotgunEventDaemon.conf"
 )
@@ -60,11 +74,52 @@ DAEMON_PROCESS_MARKERS = ("shotgunEventDaemon.py", "supervisor.py")
 SUPERVISOR_PID_FILE = "/var/log/shotgunEventDaemon/shotgunEventSupervisor.pid"
 SUPERVISOR_LOG_FILE = "/var/log/shotgunEventDaemon/shotgunEventSupervisor.log"
 TRIGGERS_LOG_ROOT = "/srv/shotgunEvents-master/src/logs"
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+SUPERVISOR_SCRIPT = os.path.join(SRC_DIR, "supervisor.py")
+
+# bxl_triggers reads its configs (BXL_Trigger_hosts among them) from
+# this entity - see TRIGGER_CONFIGS_ENTITY in common/sg_config_values.py
+TRIGGER_CONFIGS_ENTITY = "CustomNonProjectEntity35"
+
+# --fix: eventIdFile older than this while a daemon is alive means its
+# main loop is not advancing (it saves once per fetch pass)
+STUCK_LOOP_SECONDS = 600
+# --fix: how long to wait for a SIGTERMed daemon to drain and exit
+DAEMON_STOP_TIMEOUT_SECONDS = 180
+# --fix: tail of each log scanned for event ids when rebuilding the
+# eventIdFile
+LOG_SCAN_BYTES = 4 * 1024 * 1024
+EVENT_ID_PATTERNS = (
+    re.compile(r"[Ee]vent(?: id)? (\d{6,})"),
+    re.compile(r"\bid (\d{6,})"),
+    re.compile(r"event_id=(\d{6,})"),
+)
 
 DEFAULT_SITE_MAP = {
     "Boxel": ["boxel.lan", "No domain found (Localhost/Workgroup)"],
     "Centergrid": ["centergrid.boxel.lan"],
 }
+
+
+class _TeeStdout:
+    """Mirrors everything printed to stdout into an in-memory buffer."""
+
+    def __init__(self, real_stdout):
+        self._real = real_stdout
+        self.buffer = io.StringIO()
+
+    def write(self, data):
+        self._real.write(data)
+        self.buffer.write(data)
+
+    def flush(self):
+        self._real.flush()
+
+    def getvalue(self):
+        return self.buffer.getvalue()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
 
 
 def _banner(title):
@@ -201,9 +256,11 @@ def check_os_snapshot(config):
                             pid_int = int(parts[0])
                             cmd_str = parts[6]
                             if "shotgunEventDaemon.py" in cmd_str:
-                                daemon_pids.append(pid_int)
+                                if not cmd_str.strip().endswith(" stop"):
+                                    daemon_pids.append(pid_int)
                             elif "supervisor.py" in cmd_str:
-                                supervisor_pids.append(pid_int)
+                                if not cmd_str.strip().endswith(" stop"):
+                                    supervisor_pids.append(pid_int)
                         except ValueError:
                             pass
                     break
@@ -287,10 +344,10 @@ def check_sg_and_site_config(config):
     except Exception as exc:
         print(f"Could not query latest EventLogEntry: {exc}")
 
-    # Check BXL_Trigger_hosts in CustomNonProjectEntity03
+    # Check BXL_Trigger_hosts where bxl_triggers reads it
     try:
         host_cfg = sg.find_one(
-            "CustomNonProjectEntity03",
+            TRIGGER_CONFIGS_ENTITY,
             [["code", "is", "BXL_Trigger_hosts"]],
             ["code", "sg_data"],
         )
@@ -310,7 +367,7 @@ def check_sg_and_site_config(config):
                       "BXL_Trigger_hosts! Triggers checking site_execution will "
                       "refuse to register/execute on this server.")
         else:
-            print("BXL_Trigger_hosts not found in CustomNonProjectEntity03 "
+            print(f"BXL_Trigger_hosts not found in {TRIGGER_CONFIGS_ENTITY} "
                   "(using default fallback map).")
     except Exception as exc:
         print(f"Could not check BXL_Trigger_hosts in SG: {exc}")
@@ -845,7 +902,9 @@ def check_log_files(config, top=10):
                     mtime, tz=datetime.timezone.utc
                 ).isoformat()
                 errs = _scan_file_for_patterns(
-                    fpath, ("ERROR", "CRITICAL", "Traceback"), max_matches=3
+                    fpath,
+                    ("ERROR", "CRITICAL", "Type:", "Error:", "Exception:"),
+                    max_matches=6,
                 )
                 err_tag = f" [has {len(errs)} error line(s)]" if errs else ""
                 print(f"  {ts}  {fpath}{err_tag}")
@@ -977,6 +1036,448 @@ def _dry_run_plugin_registration(plugin_file, sg):
         print(f"Dry-run check encountered an error:\n{traceback.format_exc()}")
 
 
+def _write_and_send_diagnostic_report(
+    report_text, send_slack=True, target_plugin=None
+):
+    """Save diagnostic output to a .txt file and upload it to #log-pipe-triggers."""
+    hostname = socket.gethostname()
+    _fqdn, domain = _get_fqdn_domain()
+    site_name = "UnknownSite"
+    for sname, domains in DEFAULT_SITE_MAP.items():
+        if domain in domains:
+            site_name = sname
+            break
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    plugin_suffix = f"_{target_plugin}" if target_plugin else ""
+    filename = f"diagnose_{site_name}_{hostname}{plugin_suffix}_{timestamp}.txt"
+
+    # Prefer the triggers logs directory, fallback to /tmp
+    report_dir = os.path.join(TRIGGERS_LOG_ROOT, "diagnostics")
+    try:
+        os.makedirs(report_dir, exist_ok=True)
+        report_path = os.path.join(report_dir, filename)
+        with open(report_path, "w", encoding="utf-8") as fh:
+            fh.write(report_text)
+    except Exception:
+        report_dir = tempfile.gettempdir()
+        report_path = os.path.join(report_dir, filename)
+        with open(report_path, "w", encoding="utf-8") as fh:
+            fh.write(report_text)
+
+    try:
+        os.chmod(report_path, 0o666)
+    except Exception:
+        pass
+
+    print(f"\nDiagnostic report written to: {report_path}")
+
+    if not send_slack:
+        print("Skipping Slack upload (--no-slack passed).")
+        return report_path
+
+    # Count warnings in the report for a quick Slack summary header
+    warning_lines = [
+        ln.strip()
+        for ln in report_text.splitlines()
+        if "[WARNING]" in ln
+    ]
+    status_icon = ":warning:" if warning_lines else ":stethoscope:"
+    slack_header = (
+        f"{status_icon} *Daemon Diagnostic Report*\n"
+        f"     • *Site:* `{site_name}` (`{hostname}` / `{domain}`)\n"
+        f"     • *Warnings detected:* `{len(warning_lines)}`"
+    )
+    if target_plugin:
+        slack_header += f"\n     • *Target plugin:* `{target_plugin}`"
+    if warning_lines:
+        preview = "\n".join(f"       - {w}" for w in warning_lines[:5])
+        slack_header += f"\n     • *Summary:*\n{preview}"
+
+    try:
+        from bxl_triggers.common import slack_msj
+        response = slack_msj.send_slack_message_to_channel(
+            slack_header,
+            LOG_PIPE_TRIGGERS_CHANNEL_ID,
+            file_path=report_path,
+            raw_message=report_text,
+        )
+        if response and response.get("ok"):
+            print(f"Diagnostic .txt sent to Slack channel #log-pipe-triggers "
+                  f"({LOG_PIPE_TRIGGERS_CHANNEL_ID}).")
+        else:
+            print(f"Slack upload returned non-ok response: {response}")
+    except Exception:
+        print("Failed to send diagnostic .txt to Slack #log-pipe-triggers:\n"
+              f"{traceback.format_exc()}")
+
+    return report_path
+
+
+# ---------------------------------------------------------------------
+# Repair (--fix)
+# ---------------------------------------------------------------------
+
+def _list_daemon_processes():
+    """Running supervisor/daemon processes, without 'stop' helpers.
+
+    Returns:
+        dict: "daemon" and "supervisor" lists of {"pid", "etimes",
+        "cmd"}, youngest first.
+    """
+    found = {"daemon": [], "supervisor": []}
+    result = subprocess.run(
+        ["ps", "-eo", "pid,etimes,cmd"],
+        capture_output=True, text=True, timeout=10)
+    for line in result.stdout.splitlines()[1:]:
+        parts = line.split(None, 2)
+        if len(parts) < 3 or "diagnose_daemon.py" in parts[2]:
+            continue
+        cmd = parts[2].strip()
+        if cmd.endswith(" stop") or cmd.startswith("sudo "):
+            continue
+        if "shotgunEventDaemon.py" in cmd:
+            kind = "daemon"
+        elif "supervisor.py" in cmd:
+            kind = "supervisor"
+        else:
+            continue
+        try:
+            found[kind].append(
+                {"pid": int(parts[0]), "etimes": int(parts[1]), "cmd": cmd})
+        except ValueError:
+            continue
+    for kind in found:
+        found[kind].sort(key=lambda proc: proc["etimes"])
+    return found
+
+
+def _wait_for_exit(pid, timeout):
+    """Wait until a process exits.
+
+    Args:
+        pid (int): Process id.
+        timeout (int): Seconds to wait.
+
+    Returns:
+        bool: True if it exited in time.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _pid_is_alive(pid):
+            return True
+        time.sleep(2)
+    return not _pid_is_alive(pid)
+
+
+def _write_pid_file(path, pid):
+    """Write a pidfile the way daemonizer does.
+
+    Args:
+        path (str): Pidfile path.
+        pid (int): Process id.
+    """
+    with open(path, "w") as handle:
+        handle.write(f"{pid}\n")
+
+
+def _scan_logs_for_event_ids(config):
+    """Highest event id mentioned in the tail of the daemon logs.
+
+    Args:
+        config (ConfigParser): Daemon conf.
+
+    Returns:
+        tuple: (event_id or None, log path it came from or None).
+    """
+    log_dir = config.get("daemon", "logPath", fallback="")
+    if not os.path.isdir(log_dir):
+        return None, None
+    best_id, best_path = None, None
+    cutoff = time.time() - 2 * 86400
+    for path in glob.glob(os.path.join(log_dir, "*")):
+        if not os.path.isfile(path) or os.path.getmtime(path) < cutoff:
+            continue
+        if path.endswith((".pid", ".id")) or ".bak_" in path:
+            continue
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as handle:
+                if size > LOG_SCAN_BYTES:
+                    handle.seek(size - LOG_SCAN_BYTES)
+                text = handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        for pattern in EVENT_ID_PATTERNS:
+            for match in pattern.finditer(text):
+                value = int(match.group(1))
+                if best_id is None or value > best_id:
+                    best_id, best_path = value, path
+    return best_id, best_path
+
+
+def _find_resume_event_id(config, latest_sg_event_id):
+    """Last processed event id to rebuild the eventIdFile from.
+
+    In order: the oldest event still queued/processing in
+    plugin_event_queue (exact: nothing after it was finished), else the
+    highest id in the daemon logs or plugin_event_log. Never above the
+    latest event in ShotGrid.
+
+    Args:
+        config (ConfigParser): Daemon conf.
+        latest_sg_event_id (int): Latest EventLogEntry id in ShotGrid.
+
+    Returns:
+        tuple: (event_id or None, description of the source).
+    """
+    queue_min, log_table_max = None, None
+    if config.has_section("database_log"):
+        try:
+            conn, _driver = _open_db_connection(config)
+            try:
+                cursor = conn.cursor()
+                cursor.execute("SELECT MIN(event_id) FROM plugin_event_queue")
+                queue_min = (cursor.fetchone() or [None])[0]
+                cursor.execute("SELECT MAX(event_id) FROM plugin_event_log")
+                log_table_max = (cursor.fetchone() or [None])[0]
+                cursor.close()
+            finally:
+                conn.close()
+        except Exception as exc:
+            print(f"  (database not available for the resume point: {exc})")
+
+    if queue_min:
+        candidate = int(queue_min) - 1
+        source = (f"plugin_event_queue: oldest queued/processing event "
+                  f"{queue_min}, resume right before it")
+    else:
+        log_id, log_path = _scan_logs_for_event_ids(config)
+        options = []
+        if log_id:
+            options.append((log_id, f"highest event id in {log_path}"))
+        if log_table_max:
+            options.append((int(log_table_max), "plugin_event_log MAX(event_id)"))
+        if not options:
+            return None, "no event id found in the database or the logs"
+        candidate, source = max(options)
+
+    if latest_sg_event_id and candidate > latest_sg_event_id:
+        candidate = latest_sg_event_id
+        source += " (capped at the latest ShotGrid event)"
+    return candidate, source
+
+
+def _configured_collections(config):
+    """Plugin collections of the conf that exist on disk, with plugins.
+
+    Returns:
+        dict: Collection path -> sorted plugin names (file stems).
+    """
+    collections = {}
+    for path in config.get("plugins", "paths", fallback="").split(","):
+        path = path.strip()
+        if not path or not os.path.isdir(path):
+            continue
+        collections[path] = sorted(
+            os.path.splitext(name)[0] for name in os.listdir(path)
+            if name.endswith(".py") and not name.startswith("."))
+    return collections
+
+
+def _event_id_file_problem(event_id_file):
+    """Why the eventIdFile cannot be loaded, or None if it is fine."""
+    if not event_id_file:
+        return "no eventIdFile in [daemon]"
+    if not os.path.exists(event_id_file):
+        return "missing"
+    if os.path.getsize(event_id_file) == 0:
+        return "empty"
+    try:
+        with open(event_id_file, "rb") as handle:
+            data = pickle.load(handle)
+    except PermissionError as exc:
+        return f"unreadable as this user ({exc}); run with sudo"
+    except Exception as exc:
+        return f"corrupt ({exc})"
+    if not isinstance(data, dict):
+        return "legacy single-id format"
+    return None
+
+
+def run_fix(config, latest_sg_event_id, apply=False, assume_yes=False):
+    """Plan, and with apply=True run, the safe daemon repairs.
+
+    Repairs: duplicate supervisor/daemon processes, missing or stale
+    pidfiles, an unloadable eventIdFile (rebuilt from the last event id
+    found in plugin_event_queue or the logs), a stuck main loop and a
+    stopped daemon. Plugin cursors and backlogs are never rewritten.
+
+    Args:
+        config (ConfigParser): Daemon conf.
+        latest_sg_event_id (int): Latest EventLogEntry id in ShotGrid.
+        apply (bool): Run the plan instead of only printing it.
+        assume_yes (bool): Do not ask before each action.
+    """
+    _banner("Repair " + ("(applying)" if apply else "plan (dry run, use --apply)"))
+    if apply and os.geteuid() != 0:
+        print("[WARNING] --apply needs root: run it with sudo. Nothing done.")
+        return
+
+    def step(description, action):
+        print(f"\n- {description}")
+        if not apply:
+            print("  (planned)")
+            return False
+        if not assume_yes:
+            answer = input("  Apply? [y/N] ").strip().lower()
+            if answer != "y":
+                print("  Skipped.")
+                return False
+        try:
+            action()
+            print("  Done.")
+            return True
+        except Exception:
+            print(f"  [WARNING] Failed:\n{traceback.format_exc()}")
+            return False
+
+    daemon_pid_file = config.get("daemon", "pidFile", fallback=None)
+    event_id_file = config.get("daemon", "eventIdFile", fallback=None)
+    procs = _list_daemon_processes()
+    planned = 0
+
+    # 1. Duplicate supervisors / daemons
+    sup_pid, _status = _read_pid_file(SUPERVISOR_PID_FILE)
+    daemon_pid, _status = _read_pid_file(daemon_pid_file)
+    sup_pids = [proc["pid"] for proc in procs["supervisor"]]
+    daemon_pids = [proc["pid"] for proc in procs["daemon"]]
+    keep_sup = sup_pid if sup_pid in sup_pids else (
+        sup_pids[0] if sup_pids else None)
+    keep_daemon = daemon_pid if daemon_pid in daemon_pids else (
+        daemon_pids[0] if daemon_pids else None)
+
+    for pid in sup_pids:
+        if pid == keep_sup:
+            continue
+        planned += 1
+        # SIGKILL on purpose: a SIGTERMed supervisor stops "its" daemon
+        # through the shared pidfile, which points at the one we keep
+        step(f"Extra supervisor {pid} (keeping {keep_sup}): SIGKILL, so its "
+             "own cleanup does not stop the daemon in the shared pidfile",
+             lambda pid=pid: os.kill(pid, signal.SIGKILL))
+    for pid in daemon_pids:
+        if pid == keep_daemon:
+            continue
+        planned += 1
+
+        def stop_daemon(pid=pid):
+            os.kill(pid, signal.SIGTERM)
+            if not _wait_for_exit(pid, DAEMON_STOP_TIMEOUT_SECONDS):
+                raise RuntimeError(
+                    f"daemon {pid} still alive after "
+                    f"{DAEMON_STOP_TIMEOUT_SECONDS}s; stop it by hand")
+
+        step(f"Extra daemon {pid} (keeping {keep_daemon}): SIGTERM and wait "
+             "for it to drain its queues and save its state", stop_daemon)
+
+    # 2/3. Pidfiles (re-read: a stopped extra daemon deletes the shared one)
+    def fix_pid_file(path, keep_pid, label):
+        nonlocal planned
+        current, status = _read_pid_file(path)
+        if keep_pid and _pid_is_alive(keep_pid) and current != keep_pid:
+            planned += 1
+            step(f"{label} pidfile {path} is {status} (pid={current}): "
+                 f"write {keep_pid}",
+                 lambda: _write_pid_file(path, keep_pid))
+        elif not keep_pid and status.startswith("DEAD"):
+            planned += 1
+            step(f"{label} pidfile {path} points to dead pid {current}: "
+                 "remove it", lambda: os.remove(path))
+
+    if daemon_pid_file:
+        if not apply and len(daemon_pids) > 1:
+            print("\n  Note: a stopped extra daemon deletes the shared daemon "
+                  "pidfile on exit; --apply re-checks and rewrites it "
+                  f"with {keep_daemon} afterwards.")
+        fix_pid_file(daemon_pid_file, keep_daemon, "Daemon")
+    fix_pid_file(SUPERVISOR_PID_FILE, keep_sup, "Supervisor")
+
+    # 4. eventIdFile that the daemon cannot load
+    problem = _event_id_file_problem(event_id_file)
+    if problem and problem.startswith("unreadable"):
+        print(f"\n[WARNING] eventIdFile {problem}")
+    elif problem and keep_daemon:
+        print(f"\n- eventIdFile is {problem}, but daemon {keep_daemon} is "
+              "running: it keeps its cursors in memory and rewrites the "
+              "file on its next pass. No action.")
+    elif problem:
+        resume_id, source = _find_resume_event_id(config, latest_sg_event_id)
+        if resume_id is None:
+            print(f"\n- eventIdFile is {problem} and {source}: the daemon "
+                  "will start from the latest ShotGrid event on its own "
+                  "(events since its last save are skipped). No action.")
+        else:
+            planned += 1
+            gap = (latest_sg_event_id - resume_id) if latest_sg_event_id else "?"
+            collections = _configured_collections(config)
+
+            def rebuild():
+                if os.path.exists(event_id_file):
+                    backup = "{}.bak_{}".format(
+                        event_id_file,
+                        datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+                    os.replace(event_id_file, backup)
+                    print(f"  Backup: {backup}")
+                state = {
+                    path: {name: (resume_id, {}) for name in names}
+                    for path, names in collections.items()
+                }
+                with open(event_id_file, "wb") as handle:
+                    pickle.dump(state, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+            step(f"eventIdFile is {problem}: rebuild it with every plugin at "
+                 f"event {resume_id} ({source}); {gap} events to catch up "
+                 f"in {len(collections)} collection(s)", rebuild)
+
+    # 6. Daemon alive but its main loop is not saving
+    daemon_uptime = next(
+        (proc["etimes"] for proc in procs["daemon"]
+         if proc["pid"] == keep_daemon), 0)
+    if keep_daemon and not problem and event_id_file:
+        age = time.time() - os.path.getmtime(event_id_file)
+        if age > STUCK_LOOP_SECONDS and daemon_uptime > STUCK_LOOP_SECONDS:
+            planned += 1
+            if keep_sup:
+                step(f"eventIdFile not saved for {_fmt_seconds(age)} while "
+                     f"daemon {keep_daemon} is alive: SIGHUP supervisor "
+                     f"{keep_sup} to restart it",
+                     lambda: os.kill(keep_sup, signal.SIGHUP))
+            else:
+                print(f"\n[WARNING] eventIdFile not saved for "
+                      f"{_fmt_seconds(age)} and no supervisor to restart "
+                      f"daemon {keep_daemon}: restart it by hand.")
+
+    # 7. Nothing running
+    if not keep_daemon:
+        planned += 1
+        if keep_sup:
+            step(f"No daemon running under supervisor {keep_sup}: SIGHUP it "
+                 "to relaunch the daemon",
+                 lambda: os.kill(keep_sup, signal.SIGHUP))
+        else:
+            step("No supervisor nor daemon running: supervisor.py start",
+                 lambda: subprocess.run(
+                     [sys.executable, SUPERVISOR_SCRIPT, "start"],
+                     cwd=SRC_DIR, check=True, timeout=120))
+
+    if not planned:
+        print("\nNothing to repair.")
+    elif not apply:
+        print(f"\n{planned} repair(s) planned. Run again with "
+              "'sudo ... --fix --apply' to apply them.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1000,38 +1501,75 @@ def main():
         help="When used with --plugin, instantiate its BaseTrigger class "
              "and test should_register_on_this_host()."
     )
+    parser.add_argument(
+        "--no-slack", action="store_true",
+        help="Write the .txt report locally without uploading it to #log-pipe-triggers."
+    )
+    parser.add_argument(
+        "--fix", action="store_true",
+        help="After the diagnostics, print the repair plan (duplicate "
+             "processes, pidfiles, unloadable eventIdFile, stuck loop, "
+             "stopped daemon). Nothing changes without --apply."
+    )
+    parser.add_argument(
+        "--apply", action="store_true",
+        help="With --fix, run the repairs (needs sudo); asks before each one."
+    )
+    parser.add_argument(
+        "--yes", action="store_true",
+        help="With --fix --apply, do not ask before each repair."
+    )
     args = parser.parse_args()
 
-    config = read_config(CONF_PATH)
-    print(f"Diagnosing daemon using {CONF_PATH}")
-    print(f"ShotGrid server: {config.get('shotgun', 'server', fallback='?')}")
-    print(f"Run at (UTC): "
-          f"{datetime.datetime.now(datetime.timezone.utc).isoformat()}")
+    tee = _TeeStdout(sys.stdout)
+    sys.stdout = tee
+    try:
+        config = read_config(CONF_PATH)
+        print(f"Diagnosing daemon using {CONF_PATH}")
+        print(f"ShotGrid server: {config.get('shotgun', 'server', fallback='?')}")
+        print(f"Run at (UTC): "
+              f"{datetime.datetime.now(datetime.timezone.utc).isoformat()}")
 
-    check_os_snapshot(config)
-    sg, latest_sg_event_id = check_sg_and_site_config(config)
-    check_event_id_file(
-        config,
-        latest_sg_event_id=latest_sg_event_id,
-        target_plugin=args.plugin,
-        top=args.top,
-    )
-    check_database_sections(
-        config,
-        args.minutes,
-        args.hours,
-        args.top,
-        target_plugin=args.plugin,
-    )
-    check_log_files(config, top=args.top)
-
-    if args.plugin:
-        check_target_plugin(
-            config, sg, args.plugin, test_plugin=args.test_plugin
+        check_os_snapshot(config)
+        sg, latest_sg_event_id = check_sg_and_site_config(config)
+        check_event_id_file(
+            config,
+            latest_sg_event_id=latest_sg_event_id,
+            target_plugin=args.plugin,
+            top=args.top,
         )
+        check_database_sections(
+            config,
+            args.minutes,
+            args.hours,
+            args.top,
+            target_plugin=args.plugin,
+        )
+        check_log_files(config, top=args.top)
 
-    print()
-    print("Done.")
+        if args.plugin:
+            check_target_plugin(
+                config, sg, args.plugin, test_plugin=args.test_plugin
+            )
+
+        if args.fix:
+            run_fix(
+                config,
+                latest_sg_event_id,
+                apply=args.apply,
+                assume_yes=args.yes,
+            )
+
+        print()
+        print("Done.")
+    finally:
+        sys.stdout = tee._real
+
+    _write_and_send_diagnostic_report(
+        tee.getvalue(),
+        send_slack=not args.no_slack,
+        target_plugin=args.plugin,
+    )
 
 
 if __name__ == "__main__":
