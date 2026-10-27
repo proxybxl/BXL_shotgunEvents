@@ -68,6 +68,7 @@ _SITE_DOMAIN_MAP = {
 # situation by starting a replacement.
 DAEMON_STOP_POLL_INTERVAL_SECONDS = 1
 DAEMON_STOP_LOG_INTERVAL_SECONDS = 10
+DAEMON_STOP_GRACE_SECONDS = 60
 
 # How long to wait for a new pidfile to appear after 'start' before giving
 # up. Unlike the stop side above, giving up here is safe: no replacement
@@ -265,6 +266,132 @@ def _list_running_daemon_pids() -> list:
     return pids
 
 
+def _list_running_supervisor_pids(exclude_pids=()) -> list:
+    """Return a list of live `supervisor.py` PIDs (excluding `stop` or `sudo`
+    wrapper processes and any PID in `exclude_pids`).
+    """
+    if os.name == "nt":
+        return []
+    excluded = set(exclude_pids or ())
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid,cmd"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return []
+
+    pids = []
+    for line in result.stdout.splitlines()[1:]:
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        cmd = parts[1].strip()
+        if "supervisor.py" not in cmd:
+            continue
+        if (
+            "diagnose_daemon.py" in cmd
+            or cmd.endswith(" stop")
+            or cmd.startswith("sudo ")
+        ):
+            continue
+        try:
+            pid = int(parts[0])
+            if pid not in excluded and _pid_is_alive(pid):
+                pids.append(pid)
+        except ValueError:
+            continue
+    return pids
+
+
+def _purge_extra_supervisor_processes(keep_pid=None) -> list:
+    """Terminate (`SIGKILL`) all `supervisor.py` processes other than `keep_pid`
+    (and `os.getpid()`), ensuring `SUPERVISOR_PID_FILE` matches `keep_pid`.
+
+    `SIGKILL` is used deliberately so an extra supervisor's `SIGTERM` handler
+    does not stop the daemon referenced by the shared `DAEMON_PID_FILE`.
+    """
+    exclude = {os.getpid()}
+    if keep_pid is not None:
+        exclude.add(keep_pid)
+    extra_pids = _list_running_supervisor_pids(exclude_pids=exclude)
+    purged = []
+    for pid in extra_pids:
+        try:
+            _log(f"[Purge] Terminating extra supervisor process pid={pid} (SIGKILL).")
+            os.kill(pid, signal.SIGKILL)
+            purged.append(pid)
+        except OSError as exc:
+            _log(f"[Purge] Could not kill extra supervisor pid={pid}: {exc}")
+
+    if keep_pid is not None and _pid_is_alive(keep_pid):
+        if _read_pid_file(SUPERVISOR_PID_FILE) != keep_pid:
+            _write_pid_file(SUPERVISOR_PID_FILE, keep_pid)
+    return purged
+
+
+def _purge_all_daemon_processes(
+    grace_timeout: int = DUPLICATE_STOP_TIMEOUT_SECONDS,
+) -> list:
+    """Purge all running `shotgunEventDaemon.py` processes on the host so a
+    subsequent `start` or `stop` begins from a completely clean state.
+
+    Sends `SIGTERM` first so any active daemon can flush its `eventIdFile`,
+    waits up to `grace_timeout` seconds, and escalates to `SIGKILL` for any
+    process that does not exit in time. Also removes any leftover
+    `DAEMON_PID_FILE`.
+    """
+    pids = _list_running_daemon_pids()
+    pidfile_pid = _read_pid_file(DAEMON_PID_FILE)
+    if (
+        pidfile_pid is not None
+        and pidfile_pid not in pids
+        and _pid_is_alive(pidfile_pid)
+    ):
+        pids.append(pidfile_pid)
+
+    purged = []
+    if pids:
+        _log(f"[Purge] Stopping all running daemon process(es): {pids}.")
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+        deadline = time.time() + max(1, grace_timeout)
+        while time.time() < deadline:
+            alive = [p for p in pids if _pid_is_alive(p)]
+            if not alive:
+                break
+            time.sleep(1)
+
+        for pid in pids:
+            if _pid_is_alive(pid):
+                _log(
+                    f"[Purge] Daemon pid={pid} still alive after "
+                    f"{grace_timeout}s; sending SIGKILL."
+                )
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                kill_deadline = time.time() + 10
+                while time.time() < kill_deadline and _pid_is_alive(pid):
+                    time.sleep(0.5)
+            if not _pid_is_alive(pid):
+                purged.append(pid)
+
+    if os.path.exists(DAEMON_PID_FILE):
+        try:
+            os.remove(DAEMON_PID_FILE)
+        except OSError:
+            pass
+    return purged
+
+
 class SupervisorDaemon(daemonizer.Daemon):
     """Owns the daemon's lifecycle, reloads it on SIGHUP, and runs a
     coordinated watchdog thread that monitors the child daemon process,
@@ -305,11 +432,22 @@ class SupervisorDaemon(daemonizer.Daemon):
         self._restart_requested = True
 
     def _launch_child(self) -> bool:
-        """Launch the daemon in self.child_mode and confirm it came up.
+        """Purge any duplicate/orphan supervisor or daemon processes, then
+        launch a fresh daemon in `self.child_mode` and confirm it came up.
 
         Returns:
             bool: True if the daemon was confirmed running after launch.
         """
+        _purge_extra_supervisor_processes(keep_pid=os.getpid())
+        lingering = _purge_all_daemon_processes(
+            grace_timeout=DUPLICATE_STOP_TIMEOUT_SECONDS
+        )
+        if lingering:
+            _log(
+                f"[Purge] Cleaned up lingering daemon process(es) before "
+                f"launch: {lingering}."
+            )
+
         _log(f"Launching daemon in '{self.child_mode}' mode.")
         if self.child_mode == "start":
             # Ensure a stale pidfile from a previous crash/SIGKILL does not
@@ -373,20 +511,33 @@ class SupervisorDaemon(daemonizer.Daemon):
         return False
 
     def _stop_child(self) -> bool:
-        """Stop the daemon, using whichever mechanism its mode requires.
+        """Stop the daemon and purge any stray/duplicate daemon processes.
 
         Returns:
-            bool: True once the daemon is confirmed fully stopped. False
-                only when there was nothing to even attempt waiting on
-                (e.g. the 'stop' command itself couldn't be launched) -
-                never as a result of "waited long enough, giving up".
+            bool: True once all daemon processes are confirmed fully stopped.
         """
+        _purge_extra_supervisor_processes(keep_pid=os.getpid())
         if self.child_mode == "start":
-            return self._stop_child_via_cli()
-        return self._stop_child_via_process_handle()
+            ok = self._stop_child_via_cli()
+        else:
+            ok = self._stop_child_via_process_handle()
+
+        # Final sweep: purge any orphan/duplicate shotgunEventDaemon.py
+        # processes that were not tracked in DAEMON_PID_FILE.
+        stragglers = _purge_all_daemon_processes(
+            grace_timeout=DUPLICATE_STOP_TIMEOUT_SECONDS
+        )
+        if stragglers:
+            _log(
+                f"[Purge] Purged stray daemon process(es) during stop: "
+                f"{stragglers}."
+            )
+        return ok and not _list_running_daemon_pids()
 
     def _stop_child_via_cli(self) -> bool:
-        """Stop a `start`-mode daemon via its own pidfile-based `stop`."""
+        """Stop a `start`-mode daemon via its own pidfile-based `stop`,
+        escalating to SIGKILL after `DAEMON_STOP_GRACE_SECONDS` if wedged.
+        """
         pid = _read_pid_file(DAEMON_PID_FILE) or self._tracked_daemon_pid
         if pid is None or not _pid_is_alive(pid):
             if os.path.exists(DAEMON_PID_FILE):
@@ -395,7 +546,7 @@ class SupervisorDaemon(daemonizer.Daemon):
                 except OSError:
                     pass
             self._tracked_daemon_pid = None
-            _log("No live daemon found; nothing to stop.")
+            _log("No live tracked daemon found in pidfile.")
             return True
 
         _log(f"Stopping daemon (pid {pid}) via its own 'stop' command.")
@@ -418,6 +569,19 @@ class SupervisorDaemon(daemonizer.Daemon):
                     f"Still waiting for daemon (pid {pid}) to stop "
                     f"({waited}s elapsed)..."
                 )
+            if waited >= DAEMON_STOP_GRACE_SECONDS and _pid_is_alive(pid):
+                _log(
+                    f"[Purge] Daemon (pid {pid}) did not exit after "
+                    f"{DAEMON_STOP_GRACE_SECONDS}s; escalating to SIGKILL."
+                )
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                kill_deadline = time.time() + 10
+                while time.time() < kill_deadline and _pid_is_alive(pid):
+                    time.sleep(0.5)
+                break
 
         try:
             stop_helper.wait(timeout=5)
@@ -440,7 +604,7 @@ class SupervisorDaemon(daemonizer.Daemon):
                 pass
         else:
             _log(f"Daemon stop confirmed (pid {pid} exited, pidfile gone).")
-        return True
+        return not _pid_is_alive(pid)
 
     def _stop_child_via_process_handle(self) -> bool:
         """Stop a `foreground`-mode daemon directly - it has no pidfile."""
@@ -467,6 +631,15 @@ class SupervisorDaemon(daemonizer.Daemon):
                         f"{self._daemon_proc.pid}) to stop ({waited}s "
                         "elapsed)..."
                     )
+                if waited >= DAEMON_STOP_GRACE_SECONDS:
+                    _log(
+                        f"[Purge] Foreground daemon (pid "
+                        f"{self._daemon_proc.pid}) did not exit after "
+                        f"{DAEMON_STOP_GRACE_SECONDS}s; sending SIGKILL."
+                    )
+                    self._daemon_proc.kill()
+                    self._daemon_proc.wait(timeout=10)
+                    break
 
         _log(f"Foreground daemon (pid {self._daemon_proc.pid}) stop confirmed.")
         self._daemon_proc = None
@@ -979,6 +1152,26 @@ class SupervisorDaemon(daemonizer.Daemon):
         )
         # Brief pause so the daemon thread can flush the stop notification
         time.sleep(1.0)
+
+    def stop(self) -> None:
+        """Stop the supervisor and purge any remaining supervisor or daemon
+        processes on the host.
+        """
+        super(SupervisorDaemon, self).stop()
+        purged_daemons = _purge_all_daemon_processes(
+            grace_timeout=DUPLICATE_STOP_TIMEOUT_SECONDS
+        )
+        purged_sups = _purge_extra_supervisor_processes(keep_pid=None)
+        if os.path.exists(SUPERVISOR_PID_FILE):
+            try:
+                os.remove(SUPERVISOR_PID_FILE)
+            except OSError:
+                pass
+        if purged_daemons or purged_sups:
+            _log(
+                f"[Purge] Post-stop cleanup removed lingering processes "
+                f"(daemons={purged_daemons}, supervisors={purged_sups})."
+            )
 
     def _ensure_child_stopped(self) -> None:
         """Stop the child daemon, but only ever do it once."""
